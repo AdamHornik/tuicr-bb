@@ -110,6 +110,7 @@ impl fmt::Display for PrSlug {
         let kind = match self.forge {
             ForgeKind::GitHub => "gh",
             ForgeKind::GitLab => "gl",
+            ForgeKind::Bitbucket => "bb",
         };
         write!(
             f,
@@ -179,6 +180,7 @@ impl FromStr for Slug {
             let forge = match kind {
                 "gh" => ForgeKind::GitHub,
                 "gl" => ForgeKind::GitLab,
+                "bb" => ForgeKind::Bitbucket,
                 other => return Err(SlugParseError::UnknownForge(other.to_string())),
             };
             return parse_pr(forge, rest).map(Slug::Pr);
@@ -651,6 +653,19 @@ mod tests {
     fn should_roundtrip_pr_slug() {
         assert_roundtrip("gh:agavra/tuicr/pr/125");
         assert_roundtrip("gh:org/svc/pr/9999");
+        assert_roundtrip("gl:agavra/tuicr/pr/7");
+        assert_roundtrip("bb:myworkspace/myrepo/pr/42");
+    }
+
+    #[test]
+    fn should_render_pr_slug_bitbucket() {
+        let slug = PrSlug {
+            forge: ForgeKind::Bitbucket,
+            owner: "myworkspace".to_string(),
+            repo: "myrepo".to_string(),
+            number: 42,
+        };
+        assert_eq!(slug.to_string(), "bb:myworkspace/myrepo/pr/42");
     }
 
     // ---------- Parse errors ----------

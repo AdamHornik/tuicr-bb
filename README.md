@@ -1,6 +1,6 @@
 # tuicr
 
-**A code review TUI with vim keybindings. Export to GitHub, GitLab, or clipboard.**
+**A code review TUI with vim keybindings. Export to GitHub, GitLab, Bitbucket, or clipboard.**
 
 [![Crates.io](https://img.shields.io/crates/v/tuicr)](https://crates.io/crates/tuicr)
 [![License](https://img.shields.io/crates/l/tuicr)](./LICENSE)
@@ -16,10 +16,10 @@
 - GitHub-style continuous diff in the terminal. Scroll through every changed file in one stream.
 - PR-style comments at the line, range, file, and review level. 
 - Review tracking at file or hunk granularity, persisted across sessions.
-- Three export targets: push a real review to GitHub or GitLab, copy structured markdown to your
-  clipboard, or pipe to stdout.
-- Works with git, jj, and mercurial. Reviews uncommitted changes, commit ranges, or any GitHub PR
-  or GitLab MR.
+- Three export targets: push a real review to GitHub, GitLab, or Bitbucket, copy structured
+  markdown to your clipboard, or pipe to stdout.
+- Works with git, jj, and mercurial. Reviews uncommitted changes, commit ranges, or any GitHub PR,
+  GitLab MR, or Bitbucket pull request.
 
 ## Install
 
@@ -76,9 +76,9 @@ tuicr                       # Pick from a commit selector
 tuicr tui                   # Same TUI, explicit subcommand
 tuicr -w                    # Uncommitted changes (skip selector)
 tuicr -r main..HEAD         # Commit range
-tuicr pr 125                # GitHub PR
-tuicr mr 125                # GitLab MR
-tuicr tui pr 125            # GitHub PR via explicit TUI subcommand
+tuicr pr 125                # GitHub PR, GitLab MR, or Bitbucket PR (auto-detected from the remote)
+tuicr mr 125                # `mr` is an alias for `pr`
+tuicr tui pr 125            # ...via explicit TUI subcommand
 tuicr --stdout              # Pipe the review to stdout
 tuicr review list           # List saved local review sessions
 tuicr update                # Update the active installation
@@ -100,6 +100,7 @@ Auto-detects git, jj, or mercurial.
 | Vim keybindings | ✅ | ❌ | partial¹ | ❌ | ❌ |
 | Push inline review to GitHub | ✅ | ❌ | ❌ | partial² | ❌ |
 | Push inline review to GitLab | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Push inline review to Bitbucket | ✅ | ❌ | ❌ | ❌ | ❌ |
 | Agent-ready markdown export | ✅ | via CLI skill | ❌ | ❌ | ❌ |
 | git | ✅ | ✅ | ✅ | ❌ | ✅ |
 | jj | ✅ | ✅ | ✅ | ❌ | ❌ |
@@ -128,6 +129,14 @@ Requires `gh` authenticated to the repo.
 discussion notes. Review-level comments become the summary. Requires `glab` authenticated to the
 host. Request changes needs your account to be an assigned reviewer. Only Draft is GitHub-only
 here. See [docs/GITLAB.md](docs/GITLAB.md) for setup, self-hosted instances, and troubleshooting.
+
+### To Bitbucket
+
+`:submit` offers Comment, Approve, or Request changes on a Bitbucket Cloud pull request. Inline
+comments post as inline PR comments; review-level comments become a general PR comment. tuicr talks
+to the Bitbucket REST API directly (no CLI), so it needs a token: set `BITBUCKET_TOKEN`, or
+`BITBUCKET_USERNAME` + `BITBUCKET_APP_PASSWORD`. Draft is GitHub-only. See
+[docs/BITBUCKET.md](docs/BITBUCKET.md) for setup and troubleshooting.
 
 ### To your coding agent
 

@@ -47,9 +47,9 @@ src/
 │   └── jj/              # Jujutsu backend (always compiled)
 │       └── mod.rs       # JjBackend: uses jj CLI, parses with diff_parser::GitStyle
 │
-├── forge/               # Remote forge integration (GitHub PR review, experimental)
-│   ├── mod.rs           # detect_github_repository() — parse origin URL to ForgeRepository
-│   ├── traits.rs        # ForgeBackend trait, ForgeRepository, PullRequestTarget,
+├── forge/               # Remote forge integration (GitHub / GitLab / Bitbucket PR review)
+│   ├── mod.rs           # detect_forge_repository() — parse origin URL to ForgeRepository
+│   ├── traits.rs        # ForgeBackend trait, ForgeKind, ForgeRepository, PullRequestTarget,
 │   │                    # PullRequestDetails, PrSessionKey, CreateReviewRequest,
 │   │                    # GhCreateReviewResponse, ForgeFileLinesRequest
 │   ├── pr_open.rs       # Async pr-open flow: build session from details + diff
@@ -58,13 +58,19 @@ src/
 │   ├── remote_comments.rs # RemoteReviewThread shape + visibility filter
 │   ├── submit.rs        # Submit pipeline: preflight mapping, resolver actions,
 │   │                    # InlineComment payload, build_review_body, SubmitEvent
-│   └── github/          # GitHub backend (only forge in v1, via `gh` CLI)
-│       ├── mod.rs       # GitHubGhBackend: ForgeBackend impl
-│       ├── gh.rs        # GhCommandRunner: spawn `gh`, parse output, error mapping
-│       ├── models.rs    # JSON parsing for `gh` REST + GraphQL responses
-│       ├── review_threads.rs # GraphQL query for existing review threads
-│       ├── review_metadata.rs # GraphQL review commit metadata for since-last-review scoping
-│       └── submit.rs    # build_review_payload, create_review wiring
+│   ├── github/          # GitHub backend, via `gh` CLI
+│   │   ├── gh.rs        # GhCommandRunner: spawn `gh`, parse output, error mapping
+│   │   ├── models.rs    # JSON parsing for `gh` REST + GraphQL responses
+│   │   ├── review_threads.rs # GraphQL query for existing review threads
+│   │   ├── review_metadata.rs # GraphQL review commit metadata for since-last-review scoping
+│   │   └── submit.rs    # build_review_payload, create_review wiring
+│   ├── gitlab/          # GitLab backend, via `glab` CLI
+│   │   ├── glab.rs      # GlabCommandRunner: spawn `glab api`, parse output, error mapping
+│   │   └── models.rs    # JSON parsing for GitLab REST responses
+│   └── bitbucket/       # Bitbucket Cloud backend — direct HTTP (ureq), NOT a CLI
+│       ├── bb.rs        # BitbucketHttpClient trait + SystemBitbucketClient (ureq),
+│       │                # BitbucketBackend: ForgeBackend impl, auth, URL/target parsers
+│       └── models.rs    # JSON parsing for Bitbucket REST responses
 │
 ├── model/
 │   ├── mod.rs
@@ -172,7 +178,9 @@ Repository-managed agent integrations:
 
 ## Forge integration
 
-PR review (`tuicr pr <target>` or `tuicr tui pr <target>`) is the only feature in `src/forge/`. The trait shape is forge-agnostic so other forges can plug in later; v1 only ships a GitHub backend that shells out to `gh`.
+PR review (`tuicr pr <target>` or `tuicr tui pr <target>`) is the only feature in `src/forge/`. The trait shape is forge-agnostic. Three backends ship: **GitHub** (shells out to `gh`), **GitLab** (shells out to `glab`), and **Bitbucket Cloud** (talks to the REST API 2.0 directly via `ureq` — there is no ubiquitous Bitbucket CLI). `create_forge_backend` in `src/app/mod.rs` dispatches on `ForgeRepository.kind`; `parse_any_remote_url` in `src/forge/mod.rs` auto-detects the forge from the git remote (host-specific parsers first, GitHub as the catch-all fallback).
+
+Bitbucket credentials are resolved by the backend itself (no CLI owns auth): env vars first (`BITBUCKET_TOKEN` → Bearer; `BITBUCKET_USERNAME` + `BITBUCKET_APP_PASSWORD`/`BITBUCKET_API_TOKEN` → Basic), then `[forge.bitbucket]` in the tuicr config via `config::bitbucket_config_credentials()`. Tests inject a fake `BitbucketHttpClient` (`RecordingClient`) so no live HTTP runs — the same seam pattern as the CLI-runner traits.
 
 ### ForgeBackend trait
 
@@ -248,6 +256,10 @@ These are non-obvious things the implementation chain hit. Worth preserving for 
 12. **`cd` into the worktree before running `cargo`.** `cargo` resolves `Cargo.toml` from `pwd`. Running gates from the wrong worktree silently exercises the wrong tree.
 
 13. **Comments are commit-scoped via `Comment::commit_id`.** When the inline commit selector shows exactly one commit, `App::save_comment` stamps that commit's SHA on the comment. Comments with `commit_id = Some(sha)` are hidden when a different commit (or a subset not containing `sha`) is selected; `commit_id = None` (legacy, review-level, or made against the full cumulative diff) is always visible. The filter runs in `rebuild_annotations`, both diff renderers, the comment navigator (via filtered annotations), and the submit preflight. `App::comment_visible(&Comment)` is the single predicate. `AnnotatedLine::LineComment`/`FileComment` `comment_idx` is the **absolute** index into the stored `Vec`/`HashMap` value — `delete_comment_at_cursor` and `enter_edit_mode` must look it up directly, not re-count by side.
+
+14. **Bitbucket has no review object.** `create_review` posts each inline/summary comment individually (`POST .../comments`) then hits `.../approve` or `.../request-changes`. There is no pending/draft primitive, so `SubmitEvent::Draft` returns `UnsupportedOperation`. The synthesized `GhCreateReviewResponse.id` is the first posted comment id (or 0).
+
+15. **Bitbucket diffs and anchors.** `PullRequestDetails.base_sha`/`head_sha` come from `destination.commit.hash`/`source.commit.hash` (the base is the destination branch tip, not the merge-base). The `/diff` endpoint already emits git-style `diff --git` headers, so — unlike `glab mr diff` — the Bitbucket diff is fed to the parser unmodified (no `inject_git_diff_headers`). Inline comments anchor to a single line via `inline.to` (new/right side) or `inline.from` (old/left side); the `/commits` list comes back newest-first and is reversed to satisfy the oldest-first trait contract.
 
 ### Keeping Docs Updated
 

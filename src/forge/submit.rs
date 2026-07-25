@@ -882,6 +882,7 @@ mod tests {
         let comment = comment_with_line(LineSide::New, Some(11), None);
         let cfg = ForgeConfig {
             comment_type_prefix: false,
+            ..Default::default()
         };
         let mapped = map_comment(&comment, anchor_from(&comment), &typical_file(), &cfg);
         match mapped {
@@ -940,6 +941,7 @@ mod tests {
     fn should_omit_type_prefix_in_body_when_disabled() {
         let cfg = ForgeConfig {
             comment_type_prefix: false,
+            ..Default::default()
         };
         let comments = vec![note("just text")];
         let body = build_review_body(&comments, &[], &cfg);

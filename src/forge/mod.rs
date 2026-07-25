@@ -5,6 +5,7 @@
 //! instead of shelling out to forge-specific tools directly.
 #![allow(dead_code)]
 
+pub mod bitbucket;
 pub mod canonical;
 pub mod context;
 pub mod github;
@@ -19,6 +20,7 @@ use std::path::{Path, PathBuf};
 
 use git2::Repository;
 
+use crate::forge::bitbucket::bb::parse_bitbucket_remote_url;
 use crate::forge::github::gh::parse_github_remote_url;
 use crate::forge::gitlab::glab::parse_gitlab_remote_url;
 use crate::forge::traits::ForgeRepository;
@@ -97,12 +99,15 @@ fn remote_urls(repo_root: &Path) -> Vec<String> {
 
 /// Parse `url` as a forge remote repository.
 ///
-/// Tries GitLab first — its parser already filters to "gitlab" hosts, so
-/// trying it first won't claim GitHub Enterprise remotes — then falls back
-/// to GitHub, which accepts any host (covers github.com and GHE hosts whose
-/// hostname does not literally contain "github").
+/// Tries the host-specific parsers first — Bitbucket (matches only
+/// `bitbucket.org`) and GitLab (filters to "gitlab" hosts) — so neither
+/// claims a GitHub Enterprise remote, then falls back to GitHub, which accepts
+/// any host (covers github.com and GHE hosts whose hostname does not literally
+/// contain "github").
 fn parse_any_remote_url(url: &str) -> Option<ForgeRepository> {
-    parse_gitlab_remote_url(url).or_else(|| parse_github_remote_url(url))
+    parse_bitbucket_remote_url(url)
+        .or_else(|| parse_gitlab_remote_url(url))
+        .or_else(|| parse_github_remote_url(url))
 }
 
 /// Detect the forge repository for the local checkout at `repo_root`.
@@ -139,6 +144,19 @@ mod tests {
         assert_eq!(
             detect_forge_repository(dir.path()),
             Some(ForgeRepository::github("github.com", "agavra", "tuicr"))
+        );
+    }
+
+    #[test]
+    fn detects_bitbucket_repository_from_origin() {
+        let dir = init_repo_with_origin("https://bitbucket.org/myworkspace/myrepo");
+        assert_eq!(
+            detect_forge_repository(dir.path()),
+            Some(ForgeRepository::bitbucket(
+                "bitbucket.org",
+                "myworkspace",
+                "myrepo"
+            ))
         );
     }
 

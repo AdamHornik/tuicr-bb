@@ -731,15 +731,18 @@ impl App {
         target: &str,
         repo_url_override: Option<ForgeRepository>,
     ) -> Result<Self> {
+        use crate::forge::bitbucket::bb::parse_pull_request_target_bitbucket;
         use crate::forge::github::gh::parse_pull_request_target;
         use crate::forge::gitlab::glab::parse_pull_request_target_gitlab;
         use crate::forge::pr_open::open_pull_request;
         use crate::forge::traits::ForgeKind;
 
         // Try GitHub-style target first (numeric, GitHub URL, owner/repo#N).
-        // If it embeds a GitLab URL, the GitLab parser picks it up.
+        // A GitLab URL falls through to its parser; a Bitbucket
+        // `/pull-requests/` URL falls through to the Bitbucket parser.
         let parsed = parse_pull_request_target(target)
-            .or_else(|_| parse_pull_request_target_gitlab(target))?;
+            .or_else(|_| parse_pull_request_target_gitlab(target))
+            .or_else(|_| parse_pull_request_target_bitbucket(target))?;
 
         // Resolution order when the target lacks an explicit repo
         // (`tuicr pr 125`):

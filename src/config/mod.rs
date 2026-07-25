@@ -24,14 +24,46 @@ pub struct ForgeConfig {
     /// reader can see the comment classification at a glance. Defaults to
     /// `true`; set to `false` to send the raw comment body.
     pub comment_type_prefix: bool,
+    /// `[forge.bitbucket]` credentials. Environment variables take precedence
+    /// over these; `None` means "not configured here".
+    #[serde(default)]
+    pub bitbucket: Option<BitbucketConfig>,
 }
 
 impl Default for ForgeConfig {
     fn default() -> Self {
         Self {
             comment_type_prefix: true,
+            bitbucket: None,
         }
     }
+}
+
+/// Bitbucket Cloud credentials read from `[forge.bitbucket]`. When `username`
+/// is set, `token` is used as the Basic-auth secret (app password / API
+/// token); otherwise `token` is sent as a Bearer token.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct BitbucketConfig {
+    pub username: Option<String>,
+    pub token: Option<String>,
+}
+
+/// Read `[forge.bitbucket]` credentials from the config file as
+/// `(username, token)`. Best-effort: any load/parse failure yields `(None,
+/// None)` so the caller can fall back cleanly. The Bitbucket backend consults
+/// this only after environment variables are exhausted.
+pub fn bitbucket_config_credentials() -> (Option<String>, Option<String>) {
+    let Ok(outcome) = load_config() else {
+        return (None, None);
+    };
+    let Some(bitbucket) = outcome.config.and_then(|c| c.forge).and_then(|f| f.bitbucket) else {
+        return (None, None);
+    };
+    (
+        bitbucket.username.filter(|s| !s.is_empty()),
+        bitbucket.token.filter(|s| !s.is_empty()),
+    )
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -101,7 +133,7 @@ const KNOWN_KEYS: &[&str] = &[
     "forge",
 ];
 
-const FORGE_KNOWN_KEYS: &[&str] = &["comment_type_prefix"];
+const FORGE_KNOWN_KEYS: &[&str] = &["comment_type_prefix", "bitbucket"];
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ConfigLoadOutcome {
@@ -352,7 +384,40 @@ fn parse_forge(value: &Value, warnings: &mut Vec<String>) -> Option<ForgeConfig>
         any_override = true;
     }
 
+    if let Some(bitbucket) = parse_forge_bitbucket(table, warnings) {
+        cfg.bitbucket = Some(bitbucket);
+        any_override = true;
+    }
+
     if any_override { Some(cfg) } else { None }
+}
+
+/// Parse the `[forge.bitbucket]` subtable into `BitbucketConfig`. Returns
+/// `None` when the subtable is absent or carries no usable values.
+fn parse_forge_bitbucket(
+    table: &toml::Table,
+    warnings: &mut Vec<String>,
+) -> Option<BitbucketConfig> {
+    let value = table.get("bitbucket")?;
+    let Some(sub) = value.as_table() else {
+        warnings.push(
+            "Warning: Config key 'forge.bitbucket' must be a table; ignoring value".to_string(),
+        );
+        return None;
+    };
+    for key in sub.keys() {
+        if key != "username" && key != "token" {
+            warnings.push(format!(
+                "Warning: Unknown config key 'forge.bitbucket.{key}', ignoring"
+            ));
+        }
+    }
+    let username = read_string(sub, "username", warnings);
+    let token = read_string(sub, "token", warnings);
+    if username.is_none() && token.is_none() {
+        return None;
+    }
+    Some(BitbucketConfig { username, token })
 }
 
 /// Like `read_bool`, but emits a `forge.<key>` qualified warning so the user
@@ -1199,6 +1264,41 @@ comment_type_prefix = "yes"
     fn forge_defaults_enable_comment_type_prefix() {
         let cfg = ForgeConfig::default();
         assert!(cfg.comment_type_prefix);
+        assert!(cfg.bitbucket.is_none());
+    }
+
+    #[test]
+    fn should_parse_bitbucket_credentials_section() {
+        let outcome = parse_config(
+            r#"[forge.bitbucket]
+username = "alice"
+token = "secret-token"
+"#,
+        );
+        let forge = outcome
+            .config
+            .as_ref()
+            .and_then(|cfg| cfg.forge.clone())
+            .expect("forge section should parse");
+        let bitbucket = forge.bitbucket.expect("bitbucket credentials should parse");
+        assert_eq!(bitbucket.username.as_deref(), Some("alice"));
+        assert_eq!(bitbucket.token.as_deref(), Some("secret-token"));
+        assert!(outcome.warnings.is_empty());
+    }
+
+    #[test]
+    fn should_warn_on_unknown_bitbucket_key() {
+        let outcome = parse_config(
+            r#"[forge.bitbucket]
+token = "t"
+password = "oops"
+"#,
+        );
+        assert_eq!(outcome.warnings.len(), 1);
+        assert_eq!(
+            outcome.warnings[0],
+            "Warning: Unknown config key 'forge.bitbucket.password', ignoring"
+        );
     }
 
     #[test]

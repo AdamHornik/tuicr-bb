@@ -44,7 +44,7 @@ pub struct CliArgs {
 #[command(
     name = "tuicr",
     version,
-    about = "A code review TUI with vim keybindings. Export to GitHub or clipboard.",
+    about = "A code review TUI with vim keybindings. Export to GitHub, GitLab, Bitbucket, or clipboard.",
     after_help = "Press ? in the application for keybinding help.",
     disable_help_subcommand = true
 )]
@@ -137,7 +137,7 @@ struct TuiOptions {
 enum Subcmd {
     /// Open the interactive TUI.
     Tui(TuiCommand),
-    /// Review a GitHub pull request or GitLab merge request.
+    /// Review a GitHub pull request, GitLab merge request, or Bitbucket pull request.
     #[command(visible_alias = "mr")]
     Pr(PrCommand),
     /// Inspect or update persisted review sessions.
@@ -166,7 +166,7 @@ struct TuiCommand {
 
 #[derive(Subcommand, Debug, Clone)]
 enum TuiSubcmd {
-    /// Review a GitHub pull request or GitLab merge request in the TUI.
+    /// Review a GitHub pull request, GitLab merge request, or Bitbucket pull request in the TUI.
     #[command(visible_alias = "mr")]
     Pr(PrCommand),
 }
