@@ -3,19 +3,21 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Result, TuicrError};
+use crate::forge::local_git::read_blob;
 use crate::forge::remote_comments::{RemoteReviewSummary, RemoteReviewThread};
 use crate::forge::traits::{
     ForgeBackend, ForgeFileLinesRequest, ForgeRepository, GhCreateReviewResponse,
-    PagedPullRequests, PullRequestCommit, PullRequestDetails, PullRequestListQuery,
-    PullRequestListScope, PullRequestTarget,
+    PagedPullRequests, PullRequestCommit, PullRequestDetails, PullRequestInfo,
+    PullRequestListQuery, PullRequestListScope, PullRequestTarget,
 };
-use crate::model::DiffLine;
+use crate::model::{DiffLine, FilePatch};
 use crate::process::{
     CommandOutputError, CommandOutputErrorKind, run_command_output, run_command_output_with_stdin,
 };
+use crate::vcs::git::raw::{FileMetadata, pair_metadata_with_patch, run_git_diff};
 use crate::vcs::slice_context_lines;
 
-use super::models::{GhPrCommit, GhPullRequestDetails, GhPullRequestSummary};
+use super::models::{GhCompare, GhPrCommit, GhPullRequestFile, GhPullRequestSummary};
 use super::review_summaries::{
     build_query as build_reviews_query, parse_graphql_page as parse_reviews_page,
 };
@@ -29,6 +31,28 @@ const PR_LIST_JSON_FIELDS: &str =
 const PR_VIEW_JSON_FIELDS: &str = concat!(
     "number,title,url,state,isDraft,author,headRefName,baseRefName,",
     "headRefOid,baseRefOid,body,updatedAt,closed,mergedAt"
+);
+const PR_INFO_JSON_FIELDS: &str = concat!(
+    "number,title,url,state,isDraft,author,headRefName,baseRefName,",
+    "headRefOid,baseRefOid,body,updatedAt,closed,mergedAt,",
+    "reviewDecision,mergeable,mergeStateStatus,reviewRequests,latestReviews,",
+    "statusCheckRollup,comments"
+);
+const PR_INFO_JSON_FIELDS_WITHOUT_CHECKS: &str = concat!(
+    "number,title,url,state,isDraft,author,headRefName,baseRefName,",
+    "headRefOid,baseRefOid,body,updatedAt,closed,mergedAt,",
+    "reviewDecision,mergeable,mergeStateStatus,reviewRequests,latestReviews,comments"
+);
+const PR_INFO_JSON_FIELDS_WITHOUT_COMMENTS: &str = concat!(
+    "number,title,url,state,isDraft,author,headRefName,baseRefName,",
+    "headRefOid,baseRefOid,body,updatedAt,closed,mergedAt,",
+    "reviewDecision,mergeable,mergeStateStatus,reviewRequests,latestReviews,",
+    "statusCheckRollup"
+);
+const PR_INFO_JSON_FIELDS_WITHOUT_CHECKS_OR_COMMENTS: &str = concat!(
+    "number,title,url,state,isDraft,author,headRefName,baseRefName,",
+    "headRefOid,baseRefOid,body,updatedAt,closed,mergedAt,",
+    "reviewDecision,mergeable,mergeStateStatus,reviewRequests,latestReviews"
 );
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,33 +108,11 @@ impl From<CommandOutputError> for GhCommandError {
     }
 }
 
-/// Read a git blob from a checkout at `repo_root` using `git show <sha>:<path>`.
-/// Returns `None` if the object is missing or the command fails for any reason.
-fn read_blob_with_repo(repo_root: &Path, sha: &str, path: &Path) -> Option<String> {
-    let spec = format!("{}:{}", sha, path.to_string_lossy());
-    let exists = run_command_output(
-        "git",
-        Some(repo_root),
-        ["cat-file", "-e", spec.as_str()]
-            .iter()
-            .map(|s| OsStr::new(*s)),
-    );
-    if exists.is_err() {
-        return None;
-    }
-    run_command_output(
-        "git",
-        Some(repo_root),
-        ["show", spec.as_str()].iter().map(|s| OsStr::new(*s)),
-    )
-    .ok()
-}
-
 /// Return `Some(diff)` when both `start_sha` and `end_sha` are present in
 /// the local checkout at `repo_root`, by running `git diff <start>..<end>`.
 /// Returns `None` when the checkout is missing either SHA or the command
 /// fails — callers fall back to the forge in that case.
-fn local_range_diff(repo_root: &Path, start_sha: &str, end_sha: &str) -> Option<String> {
+fn local_range_diff(repo_root: &Path, start_sha: &str, end_sha: &str) -> Option<Vec<FilePatch>> {
     for sha in [start_sha, end_sha] {
         let exists = run_command_output(
             "git",
@@ -122,12 +124,7 @@ fn local_range_diff(repo_root: &Path, start_sha: &str, end_sha: &str) -> Option<
         }
     }
     let range = format!("{start_sha}..{end_sha}");
-    run_command_output(
-        "git",
-        Some(repo_root),
-        ["diff", range.as_str()].iter().map(|s| OsStr::new(*s)),
-    )
-    .ok()
+    run_git_diff(repo_root, &[range.as_str()]).ok()
 }
 
 #[derive(Debug, Clone)]
@@ -139,6 +136,11 @@ pub struct GitHubGhBackend<R = SystemGhRunner> {
     /// to `gh api`. It is **never** used as the source of truth for PR
     /// contents; the source of truth is always GitHub.
     local_checkout: Option<PathBuf>,
+    /// Whether `get_pull_request_info` requests the `statusCheckRollup` response from GitHub.
+    show_pr_checks: bool,
+    /// Whether `get_pull_request_info` requests pull-request conversation
+    /// comments from GitHub.
+    show_pr_comments: bool,
 }
 
 impl GitHubGhBackend<SystemGhRunner> {
@@ -147,6 +149,8 @@ impl GitHubGhBackend<SystemGhRunner> {
             default_repository,
             runner: SystemGhRunner,
             local_checkout: None,
+            show_pr_checks: false,
+            show_pr_comments: true,
         }
     }
 
@@ -165,11 +169,23 @@ where
             default_repository,
             runner,
             local_checkout: None,
+            show_pr_checks: false,
+            show_pr_comments: true,
         }
     }
 
     pub fn set_local_checkout(&mut self, checkout: Option<PathBuf>) {
         self.local_checkout = checkout;
+    }
+
+    pub fn with_pr_checks(mut self, show_pr_checks: bool) -> Self {
+        self.show_pr_checks = show_pr_checks;
+        self
+    }
+
+    pub fn with_pr_comments(mut self, show_pr_comments: bool) -> Self {
+        self.show_pr_comments = show_pr_comments;
+        self
     }
 
     pub fn local_checkout(&self) -> Option<&Path> {
@@ -193,6 +209,35 @@ where
         self.runner
             .run(&args)
             .map_err(|err| map_gh_error(err, host))
+    }
+
+    fn pull_request_file_metadata(&self, pr: &PullRequestDetails) -> Result<Vec<FileMetadata>> {
+        let mut metadata = Vec::new();
+        for page in 1..=30 {
+            let endpoint = format!(
+                "repos/{}/{}/pulls/{}/files?per_page=100&page={page}",
+                pr.repository.owner, pr.repository.name, pr.number
+            );
+            let mut args = vec!["api".to_string()];
+            if pr.repository.host != DEFAULT_GITHUB_HOST {
+                args.extend(["--hostname".to_string(), pr.repository.host.clone()]);
+            }
+            args.push(endpoint);
+            let output = self.run_gh(args, &pr.repository.host)?;
+            let rows: Vec<GhPullRequestFile> = serde_json::from_str(&output)?;
+            let received = rows.len();
+            metadata.extend(
+                rows.into_iter()
+                    .map(GhPullRequestFile::into_metadata)
+                    .collect::<Result<Vec<_>>>()?,
+            );
+            if received < 100 {
+                return Ok(metadata);
+            }
+        }
+        Err(TuicrError::Forge(
+            "GitHub pull request exceeds the 3000-file REST API limit".into(),
+        ))
     }
 }
 
@@ -238,6 +283,10 @@ where
     }
 
     fn get_pull_request(&self, target: PullRequestTarget) -> Result<PullRequestDetails> {
+        Ok(self.get_pull_request_info(target)?.details)
+    }
+
+    fn get_pull_request_info(&self, target: PullRequestTarget) -> Result<PullRequestInfo> {
         let repository = self.resolve_repository(&target)?;
         let output = self.run_gh(
             vec![
@@ -247,15 +296,20 @@ where
                 "--repo".to_string(),
                 gh_repo_arg(&repository),
                 "--json".to_string(),
-                PR_VIEW_JSON_FIELDS.to_string(),
+                match (self.show_pr_checks, self.show_pr_comments) {
+                    (true, true) => PR_INFO_JSON_FIELDS,
+                    (false, true) => PR_INFO_JSON_FIELDS_WITHOUT_CHECKS,
+                    (true, false) => PR_INFO_JSON_FIELDS_WITHOUT_COMMENTS,
+                    (false, false) => PR_INFO_JSON_FIELDS_WITHOUT_CHECKS_OR_COMMENTS,
+                }
+                .to_string(),
             ],
             &repository.host,
         )?;
-        let pr: GhPullRequestDetails = serde_json::from_str(&output)?;
-        pr.into_details(&repository)
+        super::pr_info::parse_pull_request_info(&output, &repository)
     }
 
-    fn get_pull_request_diff(&self, pr: &PullRequestDetails) -> Result<String> {
+    fn get_pull_request_diff(&self, pr: &PullRequestDetails) -> Result<Vec<FilePatch>> {
         // We want the *cumulative* diff between base and head for the PR.
         // `gh pr diff --patch` returns mbox-style `git format-patch` output
         // — one patch per commit — so a 7-commit PR yields 7 separate
@@ -263,7 +317,8 @@ where
         // into duplicate `DiffFile`s. Plain `gh pr diff` (no `--patch`)
         // returns the single cumulative diff. Hard-won lesson; see the
         // duplicate-files-in-list bug.
-        self.run_gh(
+        let metadata = self.pull_request_file_metadata(pr)?;
+        let patch = self.run_gh(
             vec![
                 "pr".to_string(),
                 "diff".to_string(),
@@ -274,7 +329,8 @@ where
                 "never".to_string(),
             ],
             &pr.repository.host,
-        )
+        )?;
+        pair_metadata_with_patch(metadata, patch.as_bytes())
     }
 
     fn local_checkout_path(&self) -> Option<PathBuf> {
@@ -313,7 +369,7 @@ where
         pr: &PullRequestDetails,
         start_sha: &str,
         end_sha: &str,
-    ) -> Result<String> {
+    ) -> Result<Vec<FilePatch>> {
         // Fast path: when both SHAs live in the local checkout, `git diff`
         // gives us the cumulative diff in O(local-IO) without round-tripping
         // through GitHub. The PR diff text is the source of truth, but the
@@ -325,12 +381,26 @@ where
             return Ok(diff);
         }
 
-        // Fall back to GitHub's compare API. `Accept: application/vnd.github.diff`
-        // returns plain unified diff text instead of the JSON wrapper.
+        // The JSON response provides authoritative file metadata; a second
+        // request asks for the full patch. Their shared source order lets us
+        // pair them without inspecting display-oriented path headers.
         let endpoint = format!(
             "repos/{}/{}/compare/{}...{}",
             pr.repository.owner, pr.repository.name, start_sha, end_sha,
         );
+        let mut metadata_args = vec!["api".to_string()];
+        if pr.repository.host != DEFAULT_GITHUB_HOST {
+            metadata_args.extend(["--hostname".to_string(), pr.repository.host.clone()]);
+        }
+        metadata_args.push(endpoint.clone());
+        let metadata_output = self.run_gh(metadata_args, &pr.repository.host)?;
+        let compare: GhCompare = serde_json::from_str(&metadata_output)?;
+        let metadata = compare
+            .files
+            .into_iter()
+            .map(GhPullRequestFile::into_metadata)
+            .collect::<Result<Vec<_>>>()?;
+
         let mut args = vec![
             "api".to_string(),
             "-H".to_string(),
@@ -341,7 +411,8 @@ where
             args.push(pr.repository.host.clone());
         }
         args.push(endpoint);
-        self.run_gh(args, &pr.repository.host)
+        let patch = self.run_gh(args, &pr.repository.host)?;
+        pair_metadata_with_patch(metadata, patch.as_bytes())
     }
 
     fn list_review_threads(&self, pr: &PullRequestDetails) -> Result<Vec<RemoteReviewThread>> {
@@ -422,38 +493,26 @@ where
         if request.start_line == 0 || request.start_line > request.end_line {
             return Ok(Vec::new());
         }
+        let (start_line, end_line) = (request.start_line, request.end_line);
+        let content = self.fetch_file_content(request)?;
+        Ok(slice_context_lines(&content, start_line, end_line))
+    }
 
-        // Local optimization: read the blob from a configured checkout when
-        // we have it. The PR's exact SHAs may or may not be present locally;
-        // we silently fall back if they aren't.
-        let local_content = self
+    /// Local blob when the checkout has the PR's SHA, REST otherwise. The PR's
+    /// exact SHAs may or may not be present locally; we silently fall back.
+    fn fetch_file_content(&self, request: ForgeFileLinesRequest) -> Result<String> {
+        match self
             .local_checkout
             .as_deref()
-            .and_then(|root| read_blob_with_repo(root, request.sha(), request.path.as_path()));
-
-        let content = if let Some(content) = local_content {
-            content
-        } else {
-            self.fetch_file_via_api(&request)?
-        };
-
-        Ok(slice_context_lines(
-            &content,
-            request.start_line,
-            request.end_line,
-        ))
+            .and_then(|root| read_blob(root, request.sha(), request.path.as_path()))
+        {
+            Some(content) => Ok(content),
+            None => self.fetch_file_via_api(&request),
+        }
     }
 
     fn file_line_count(&self, request: ForgeFileLinesRequest) -> Result<u32> {
-        let local_content = self
-            .local_checkout
-            .as_deref()
-            .and_then(|root| read_blob_with_repo(root, request.sha(), request.path.as_path()));
-        let content = if let Some(content) = local_content {
-            content
-        } else {
-            self.fetch_file_via_api(&request)?
-        };
+        let content = self.fetch_file_content(request)?;
         Ok(content.lines().count() as u32)
     }
 
@@ -619,7 +678,7 @@ pub fn parse_github_remote_url(remote_url: &str) -> Option<ForgeRepository> {
         .map(|(_, rest)| rest)
         .unwrap_or(without_scheme);
     let (host, path) = without_user.split_once('/')?;
-    repository_from_path(host, path)
+    repository_from_path(strip_port(host), path)
 }
 
 fn parse_numeric_target(target: &str) -> Option<PullRequestTarget> {
@@ -696,6 +755,8 @@ fn parse_repo_hash_target(target: &str) -> Option<PullRequestTarget> {
 fn forge_repo_from_host(host: &str, owner: &str, repo: &str) -> ForgeRepository {
     if host.contains("gitlab") {
         ForgeRepository::gitlab(host, owner, repo)
+    } else if crate::forge::gitea::tea::is_gitea_host(host) {
+        ForgeRepository::gitea(host, owner, repo)
     } else {
         ForgeRepository::github(host, owner, repo)
     }
@@ -809,6 +870,18 @@ fn trim_url_suffix(value: &str) -> &str {
         .next()
         .unwrap_or(value)
         .trim_end_matches('/')
+}
+
+/// Strip a trailing `:<port>` from a host, e.g. `example.com:2222` ->
+/// `example.com`. `ssh://` remotes commonly carry a non-default SSH port
+/// (GitHub Enterprise instances behind a custom port); that port is
+/// meaningless for the HTTPS API host used to build `--repo` arguments, and
+/// left in place it turns into a broken URL.
+fn strip_port(host: &str) -> &str {
+    match host.rsplit_once(':') {
+        Some((h, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => h,
+        _ => host,
+    }
 }
 
 fn strip_git_suffix(value: &str) -> &str {
@@ -1069,13 +1142,27 @@ index 1111111..2222222 100644
                 Some("api")
                     if args
                         .iter()
+                        .any(|a| a.contains("/pulls/") && a.contains("/files")) =>
+                {
+                    Ok(PR_FILES_JSON.to_string())
+                }
+                Some("api")
+                    if args
+                        .iter()
                         .any(|a| a.contains("/pulls/") && a.contains("/commits")) =>
                 {
                     Ok(PR_COMMITS_JSON.to_string())
                 }
                 // gh api repos/.../compare/<base>...<head> (range diff).
                 Some("api") if args.iter().any(|a| a.contains("/compare/")) => {
-                    Ok(COMPARE_DIFF.to_string())
+                    if args
+                        .iter()
+                        .any(|a| a == "Accept: application/vnd.github.diff")
+                    {
+                        Ok(COMPARE_DIFF.to_string())
+                    } else {
+                        Ok(COMPARE_JSON.to_string())
+                    }
                 }
                 _ => Err(GhCommandError::Failed {
                     status: Some(1),
@@ -1122,6 +1209,10 @@ index 1111111..2222222 100644
             }
         }
     ]"##;
+
+    const PR_FILES_JSON: &str = r##"[{"filename":"src/lib.rs","status":"modified"}]"##;
+
+    const COMPARE_JSON: &str = r##"{"files":[{"filename":"src/lib.rs","status":"modified"}]}"##;
 
     const COMPARE_DIFF: &str = r##"diff --git a/src/lib.rs b/src/lib.rs
 index 1111111..2222222 100644
@@ -1297,6 +1388,17 @@ index 1111111..2222222 100644
     fn parses_ssh_remote_url() {
         let repository =
             parse_github_remote_url("ssh://git@github.example.com/agavra/tuicr.git").unwrap();
+        assert_eq!(repository.host, "github.example.com");
+        assert_eq!(repository.slug(), "agavra/tuicr");
+    }
+
+    #[test]
+    fn parses_ssh_remote_url_with_custom_port() {
+        // GitHub Enterprise instances behind a non-default SSH port must not
+        // leak that port into the ForgeRepository host; it breaks `--repo`
+        // URL construction against the HTTPS API.
+        let repository =
+            parse_github_remote_url("ssh://git@github.example.com:2222/agavra/tuicr.git").unwrap();
         assert_eq!(repository.host, "github.example.com");
         assert_eq!(repository.slug(), "agavra/tuicr");
     }
@@ -1610,6 +1712,57 @@ Match host github-work
     }
 
     #[test]
+    fn can_skip_pull_request_check_rollup() {
+        let runner = FakeGhRunner::default();
+        let backend = GitHubGhBackend::with_runner(Some(repo()), runner).with_pr_checks(false);
+
+        let info = backend
+            .get_pull_request_info(parse_pull_request_target("125").unwrap())
+            .unwrap();
+
+        assert!(info.checks.is_empty());
+        let calls = backend.runner.calls.borrow();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].last().map(String::as_str),
+            Some(PR_INFO_JSON_FIELDS_WITHOUT_CHECKS)
+        );
+        assert!(
+            !calls[0]
+                .last()
+                .expect("expected --json field list")
+                .contains("statusCheckRollup")
+        );
+    }
+
+    #[test]
+    fn can_skip_pull_request_conversation_comments() {
+        let runner = FakeGhRunner::default();
+        let backend = GitHubGhBackend::with_runner(Some(repo()), runner)
+            .with_pr_checks(true)
+            .with_pr_comments(false);
+
+        let info = backend
+            .get_pull_request_info(parse_pull_request_target("125").unwrap())
+            .unwrap();
+
+        assert!(info.issue_comments.is_empty());
+        let calls = backend.runner.calls.borrow();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].last().map(String::as_str),
+            Some(PR_INFO_JSON_FIELDS_WITHOUT_COMMENTS)
+        );
+        assert!(
+            !calls[0]
+                .last()
+                .expect("expected --json field list")
+                .split(',')
+                .any(|field| field == "comments")
+        );
+    }
+
+    #[test]
     fn get_pull_request_requires_repository() {
         let runner = FakeGhRunner::default();
         let backend = GitHubGhBackend::with_runner(None, runner);
@@ -1620,15 +1773,20 @@ Match host github-work
     }
 
     #[test]
-    fn get_pull_request_diff_returns_patch_text() {
+    fn get_pull_request_diff_pairs_metadata_with_patch_text() {
         let runner = FakeGhRunner::default();
         let backend = GitHubGhBackend::with_runner(Some(repo()), runner);
         let details = backend
             .get_pull_request(parse_pull_request_target("125").unwrap())
             .unwrap();
-        let patch = backend.get_pull_request_diff(&details).unwrap();
+        let patches = backend.get_pull_request_diff(&details).unwrap();
 
-        assert_eq!(patch, PR_PATCH);
+        assert_eq!(patches.len(), 1);
+        assert_eq!(
+            patches[0].new_path.as_deref(),
+            Some(Path::new("src/lib.rs"))
+        );
+        assert_eq!(patches[0].patch, PR_PATCH.trim_start());
     }
 
     #[test]
@@ -1789,7 +1947,8 @@ Match host github-work
             .get_pull_request_commit_range_diff(&details, "baseaaa", "headbbb")
             .unwrap();
         // then
-        assert!(diff.contains("diff --git a/src/lib.rs"));
+        assert_eq!(diff.len(), 1);
+        assert!(diff[0].patch.contains("diff --git a/src/lib.rs"));
         // and — the call hit the compare endpoint with the Accept diff header.
         let calls = backend.runner.calls.borrow();
         let compare_call = calls
@@ -1797,6 +1956,9 @@ Match host github-work
             .find(|args| {
                 args.iter()
                     .any(|a| a.contains("/compare/baseaaa...headbbb"))
+                    && args
+                        .iter()
+                        .any(|a| a == "Accept: application/vnd.github.diff")
             })
             .expect("expected a compare api call");
         assert!(compare_call.contains(&"Accept: application/vnd.github.diff".to_string()));
@@ -1835,6 +1997,7 @@ Match host github-work
             counterpart_line: None,
             start_line: None,
             start_side: None,
+            range_anchors: None,
             old_path: None,
             body: body.to_string(),
             comment_id: format!("cid-{line}"),

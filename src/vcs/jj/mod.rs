@@ -10,19 +10,25 @@ use chrono::{DateTime, Utc};
 use crate::error::{Result, TuicrError};
 use crate::model::{DiffFile, DiffLine, FileStatus};
 use crate::syntax::SyntaxHighlighter;
-use crate::vcs::diff_parser::{self, DiffFormat};
+use crate::vcs::diff_parser;
+use crate::vcs::git::raw::{FileMetadata, pair_metadata_with_patch};
 use crate::vcs::traits::{
     CommitInfo, DiffWhitespaceMode, ResolvedRevisionRange, RevisionDiffTarget, VcsBackend, VcsInfo,
     VcsType,
 };
+use crate::vcs::whitespace::{WhitespaceComparison, materialize_diff};
 use crate::vcs::{
     BATCH_BOUNDARY, apply_container_full_file_highlight, parse_batched_files, slice_context_lines,
 };
 
 /// Parse a jj description into (summary, optional body).
 fn parse_description(desc: &str) -> (String, Option<String>) {
+    if desc.trim().is_empty() {
+        return ("(no description set)".to_string(), None);
+    }
+
     let mut lines = desc.lines();
-    let summary = lines.next().unwrap_or("(no message)").to_string();
+    let summary = lines.next().unwrap_or("(no description set)").to_string();
     let body_text: String = lines
         .skip_while(|l| l.trim().is_empty())
         .collect::<Vec<_>>()
@@ -47,7 +53,7 @@ impl JjBackend {
         // Use `jj root` to find the repository root
         // This handles being called from subdirectories
         let root_output = Command::new("jj")
-            .args(["root"])
+            .args(["root", "--color=never"])
             .output()
             .map_err(|e| TuicrError::VcsCommand(format!("Failed to run jj: {}", e)))?;
 
@@ -122,8 +128,8 @@ impl JjBackend {
         })
     }
 
-    fn diff_args<'a>(&self, args: &'a [&'a str]) -> Cow<'a, [&'a str]> {
-        if !self.whitespace_mode.ignores_all() {
+    fn diff_args<'a>(comparison: WhitespaceComparison, args: &'a [&'a str]) -> Cow<'a, [&'a str]> {
+        if !comparison.ignores_all() {
             return Cow::Borrowed(args);
         }
 
@@ -133,6 +139,89 @@ impl JjBackend {
         args_with_whitespace.extend_from_slice(&args[1..]);
         Cow::Owned(args_with_whitespace)
     }
+
+    fn load_diff(
+        &self,
+        diff_args: &[&str],
+        highlighter: &SyntaxHighlighter,
+    ) -> Result<Vec<DiffFile>> {
+        let mut snapshot_done = false;
+        materialize_diff(&self.whitespace_mode, |comparison| {
+            let ignore_working_copy = snapshot_done;
+            snapshot_done = true;
+            self.load_diff_with_comparison(diff_args, comparison, highlighter, ignore_working_copy)
+        })
+    }
+
+    fn load_diff_with_comparison(
+        &self,
+        diff_args: &[&str],
+        comparison: WhitespaceComparison,
+        highlighter: &SyntaxHighlighter,
+        ignore_working_copy: bool,
+    ) -> Result<Vec<DiffFile>> {
+        let args = Self::diff_args(comparison, diff_args);
+        let mut metadata_args: Vec<&str> = args.iter().copied().collect();
+        if ignore_working_copy {
+            metadata_args.insert(1, "--ignore-working-copy");
+        }
+        metadata_args.extend(["-T", JJ_DIFF_METADATA_TEMPLATE]);
+        // The first command snapshots the working copy when needed. Later
+        // Auto-mode passes pass `--ignore-working-copy` so metadata and hunks
+        // stay on that same operation.
+        let metadata_output = run_jj_command(&self.info.root_path, metadata_args)?;
+        let metadata = parse_jj_diff_metadata(&metadata_output)?;
+        if metadata.is_empty() {
+            return Err(TuicrError::NoChanges);
+        }
+
+        let mut patch_args: Vec<&str> = args.iter().copied().collect();
+        patch_args.extend(["--git", "--ignore-working-copy"]);
+        let patch = run_jj_command(&self.info.root_path, patch_args)?;
+        let patches = pair_metadata_with_patch(metadata, patch.as_bytes())?;
+        diff_parser::parse_file_patches(patches, highlighter)
+    }
+}
+
+const JJ_DIFF_METADATA_TEMPLATE: &str =
+    r#"status_char ++ "\0" ++ source.path() ++ "\0" ++ target.path() ++ "\0""#;
+
+fn parse_jj_diff_metadata(output: &str) -> Result<Vec<FileMetadata>> {
+    let fields: Vec<&str> = output.split('\0').collect();
+    let records = fields.strip_suffix(&[""]).unwrap_or(&fields);
+    if !records.len().is_multiple_of(3) {
+        return Err(TuicrError::VcsCommand(format!(
+            "invalid jj diff metadata: expected status/source/target triples, got {} fields",
+            records.len()
+        )));
+    }
+
+    records
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .map(|record| {
+            let source = (!record[1].is_empty()).then(|| PathBuf::from(record[1]));
+            let target = (!record[2].is_empty()).then(|| PathBuf::from(record[2]));
+            let (old_path, new_path, status) = match record[0] {
+                "A" => (None, target, FileStatus::Added),
+                "D" => (source, None, FileStatus::Deleted),
+                "M" => (source, target, FileStatus::Modified),
+                "R" => (source, target, FileStatus::Renamed),
+                "C" => (source, target, FileStatus::Copied),
+                status => {
+                    return Err(TuicrError::VcsCommand(format!(
+                        "invalid jj diff metadata status `{status}`"
+                    )));
+                }
+            };
+            Ok(FileMetadata {
+                old_path,
+                new_path,
+                status,
+            })
+        })
+        .collect()
 }
 
 impl VcsBackend for JjBackend {
@@ -141,15 +230,7 @@ impl VcsBackend for JjBackend {
     }
 
     fn get_working_tree_diff(&self, highlighter: &SyntaxHighlighter) -> Result<Vec<DiffFile>> {
-        let args = self.diff_args(&["diff", "--git"]);
-        let diff_output = run_jj_command(&self.info.root_path, args.iter().copied())?;
-
-        if diff_output.trim().is_empty() {
-            return Err(TuicrError::NoChanges);
-        }
-
-        let mut files =
-            diff_parser::parse_unified_diff(&diff_output, DiffFormat::GitStyle, highlighter)?;
+        let mut files = self.load_diff(&["diff"], highlighter)?;
         apply_container_full_file_highlight(
             &self.info.root_path,
             "@-",
@@ -173,17 +254,14 @@ impl VcsBackend for JjBackend {
             return Ok(Vec::new());
         }
 
-        let path_str = file_path.to_string_lossy();
+        let fileset = jj_fileset_arg(file_path);
         let content = if let Some(commit) = ref_commit {
             run_jj_command(
                 &self.info.root_path,
-                ["file", "show", "-r", commit, &path_str],
+                ["file", "show", "-r", commit, &fileset],
             )?
         } else if file_status == FileStatus::Deleted {
-            run_jj_command(
-                &self.info.root_path,
-                ["file", "show", "-r", "@-", &path_str],
-            )?
+            run_jj_command(&self.info.root_path, ["file", "show", "-r", "@-", &fileset])?
         } else {
             std::fs::read_to_string(self.info.root_path.join(file_path))?
         };
@@ -197,17 +275,14 @@ impl VcsBackend for JjBackend {
         file_status: FileStatus,
         ref_commit: Option<&str>,
     ) -> Result<u32> {
-        let path_str = file_path.to_string_lossy();
+        let fileset = jj_fileset_arg(file_path);
         let content = if let Some(commit) = ref_commit {
             run_jj_command(
                 &self.info.root_path,
-                ["file", "show", "-r", commit, &path_str],
+                ["file", "show", "-r", commit, &fileset],
             )?
         } else if file_status == FileStatus::Deleted {
-            run_jj_command(
-                &self.info.root_path,
-                ["file", "show", "-r", "@-", &path_str],
-            )?
+            run_jj_command(&self.info.root_path, ["file", "show", "-r", "@-", &fileset])?
         } else {
             std::fs::read_to_string(self.info.root_path.join(file_path))?
         };
@@ -324,16 +399,8 @@ impl VcsBackend for JjBackend {
         // Get the parent of the oldest commit to include its changes
         // In jj, we use {commit}- to get the parent(s)
         let from_rev = format!("{}-", oldest);
-        let diff_args = ["diff", "--from", &from_rev, "--to", newest, "--git"];
-        let args = self.diff_args(&diff_args);
-        let diff_output = run_jj_command(&self.info.root_path, args.iter().copied())?;
-
-        if diff_output.trim().is_empty() {
-            return Err(TuicrError::NoChanges);
-        }
-
-        let mut files =
-            diff_parser::parse_unified_diff(&diff_output, DiffFormat::GitStyle, highlighter)?;
+        let diff_args = ["diff", "--from", &from_rev, "--to", newest];
+        let mut files = self.load_diff(&diff_args, highlighter)?;
         apply_container_full_file_highlight(
             &self.info.root_path,
             &from_rev,
@@ -410,16 +477,8 @@ impl VcsBackend for JjBackend {
 
         // Diff from the parent of the oldest commit to the working copy (@)
         let from_rev = format!("{}-", oldest);
-        let diff_args = ["diff", "--from", &from_rev, "--to", "@", "--git"];
-        let args = self.diff_args(&diff_args);
-        let diff_output = run_jj_command(&self.info.root_path, args.iter().copied())?;
-
-        if diff_output.trim().is_empty() {
-            return Err(TuicrError::NoChanges);
-        }
-
-        let mut files =
-            diff_parser::parse_unified_diff(&diff_output, DiffFormat::GitStyle, highlighter)?;
+        let diff_args = ["diff", "--from", &from_rev, "--to", "@"];
+        let mut files = self.load_diff(&diff_args, highlighter)?;
         apply_container_full_file_highlight(
             &self.info.root_path,
             &from_rev,
@@ -432,6 +491,23 @@ impl VcsBackend for JjBackend {
     }
 }
 
+/// Render `path` as a jj fileset argument that matches it and nothing else.
+///
+/// jj parses positional path arguments as fileset expressions, so a file name
+/// containing meta characters (`(`, `)`, `|`, `&`, `~`, whitespace, ...) is a
+/// syntax error when passed bare -- see
+/// <https://github.com/agavra/tuicr/issues/602>. Wrapping the name in a quoted
+/// string literal keeps it out of the expression grammar, and the `root-file:`
+/// prefix pins it to an exact workspace-relative path (the paths we pass come
+/// from diff output, which is always workspace-relative).
+fn jj_fileset_arg(path: &Path) -> String {
+    let escaped = path
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    format!("root-file:\"{escaped}\"")
+}
+
 /// Fetch the full content of `paths` at `rev` in a single `jj file show`
 /// subprocess. jj is much cheaper per-call than hg, but batching still avoids
 /// repeated process startup when there are many container files in a diff.
@@ -440,12 +516,9 @@ fn jj_show_batch(root: &Path, rev: &str, paths: &[PathBuf]) -> Result<HashMap<Pa
         return Ok(HashMap::new());
     }
     let template = format!("\"\\n{BATCH_BOUNDARY}\\n\" ++ path ++ \"\\n\"");
-    let path_strs: Vec<String> = paths
-        .iter()
-        .map(|p| p.to_string_lossy().into_owned())
-        .collect();
+    let filesets: Vec<String> = paths.iter().map(|p| jj_fileset_arg(p)).collect();
     let mut args: Vec<&str> = vec!["file", "show", "-r", rev, "-T", &template];
-    args.extend(path_strs.iter().map(String::as_str));
+    args.extend(filesets.iter().map(String::as_str));
     let output = run_jj_command(root, &args)?;
     Ok(parse_batched_files(&output))
 }
@@ -458,6 +531,7 @@ where
 {
     let args: Vec<S> = args.into_iter().collect();
     let output = Command::new("jj")
+        .arg("--color=never")
         .current_dir(root)
         .args(args.iter().map(|arg| arg.as_ref()))
         .output()
@@ -485,6 +559,7 @@ mod tests {
     use crate::model::LineOrigin;
     use crate::vcs::RevisionDiffTarget;
     use std::fs;
+    use std::sync::Once;
 
     /// Check if jj command is available
     fn jj_available() -> bool {
@@ -495,10 +570,54 @@ mod tests {
             .unwrap_or(false)
     }
 
+    /// Point `JJ_CONFIG` at a throwaway config file that disables commit
+    /// signing, for the lifetime of this test process.
+    ///
+    /// `--config signing.behavior=drop` on `jj_cmd()`'s own invocations
+    /// isn't enough: `JjBackend` methods under test (e.g.
+    /// `get_working_tree_diff`) shell out to `jj` themselves via
+    /// `run_jj_command`, and that production code path must stay
+    /// unmodified so real users' signing config keeps working. Overriding
+    /// `JJ_CONFIG` on the test process's environment means every `jj`
+    /// child process spawned for the rest of this run inherits it,
+    /// including ones spawned by the backend under test, without ever
+    /// touching the developer's real `~/.config/jj`. This keeps
+    /// contributors with `signing.behavior = "own"` configured globally
+    /// from being prompted to sign throwaway commits in temp repos.
+    fn disable_jj_signing_for_tests() {
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            let config_path = std::env::temp_dir().join("tuicr-test-jj-config.toml");
+            fs::write(
+                &config_path,
+                "signing.behavior = \"drop\"\n\
+                 user.name = \"Tuicr Test\"\n\
+                 user.email = \"tuicr@example.com\"\n",
+            )
+            .expect("failed to write throwaway jj test config");
+            // SAFETY: guarded by `Once`, so this runs exactly once, before
+            // any test spawns a `jj` child process; nothing else in this
+            // crate reads or writes `JJ_CONFIG`.
+            unsafe {
+                std::env::set_var("JJ_CONFIG", &config_path);
+            }
+        });
+    }
+
+    /// `jj` invocation with commit signing disabled. Overrides any global
+    /// `signing.behavior = "own"` config so contributors who sign their own
+    /// commits aren't prompted to sign throwaway commits in these temp repos.
+    fn jj_cmd() -> Command {
+        disable_jj_signing_for_tests();
+        let mut cmd = Command::new("jj");
+        cmd.args(["--config", "signing.behavior=drop"]);
+        cmd
+    }
+
     /// Discover a Jujutsu repository from a specific directory
     fn discover_in(path: &Path) -> Result<JjBackend> {
-        let root_output = Command::new("jj")
-            .args(["root"])
+        let root_output = jj_cmd()
+            .args(["root", "--color=never"])
             .current_dir(path)
             .output()
             .map_err(|e| TuicrError::VcsCommand(format!("Failed to run jj: {}", e)))?;
@@ -523,7 +642,7 @@ mod tests {
         let root = temp_dir.path();
 
         // Initialize jj repo (jj init creates a git-backed repo by default)
-        let output = Command::new("jj")
+        let output = jj_cmd()
             .args(["git", "init"])
             .current_dir(root)
             .output()
@@ -541,7 +660,7 @@ mod tests {
         fs::write(root.join("hello.txt"), "hello world\n").expect("Failed to write file");
 
         // Snapshot the changes (jj auto-tracks files)
-        Command::new("jj")
+        jj_cmd()
             .args(["commit", "-m", "Initial commit"])
             .current_dir(root)
             .output()
@@ -552,6 +671,18 @@ mod tests {
             .expect("Failed to modify file");
 
         Some(temp_dir)
+    }
+
+    #[test]
+    fn empty_description_uses_jj_wording() {
+        assert_eq!(
+            parse_description(""),
+            ("(no description set)".to_string(), None)
+        );
+        assert_eq!(
+            parse_description("  \n"),
+            ("(no description set)".to_string(), None)
+        );
     }
 
     #[test]
@@ -601,6 +732,32 @@ mod tests {
     }
 
     #[test]
+    fn test_jj_uses_template_paths_instead_of_git_headers() {
+        let Some(temp) = setup_test_repo() else {
+            eprintln!("Skipping test: jj command not available");
+            return;
+        };
+        let path = PathBuf::from("日本語 b/left and right.txt");
+        fs::create_dir_all(temp.path().join(path.parent().unwrap())).unwrap();
+        fs::write(temp.path().join(&path), "base\n").unwrap();
+        jj_cmd()
+            .args(["commit", "-m", "add ambiguous path"])
+            .current_dir(temp.path())
+            .output()
+            .unwrap();
+        fs::write(temp.path().join(&path), "base\nchanged\n").unwrap();
+
+        let backend = JjBackend::from_path(temp.path().to_path_buf(), DiffWhitespaceMode::Normal)
+            .expect("Failed to create jj backend");
+        let files = backend
+            .get_working_tree_diff(&SyntaxHighlighter::default())
+            .expect("structured jj diff should parse");
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].new_path.as_deref(), Some(path.as_path()));
+    }
+
+    #[test]
     fn test_jj_diff_surfaces_noop_file_when_whitespace_only_diff_is_empty() {
         let Some(temp) = setup_test_repo() else {
             eprintln!("Skipping test: jj command not available");
@@ -636,7 +793,7 @@ mod tests {
 
         fs::write(temp.path().join("hello.txt"), " hello world \n")
             .expect("Failed to write whitespace-only edit");
-        let output = Command::new("jj")
+        let output = jj_cmd()
             .args(["commit", "-m", "Whitespace commit"])
             .current_dir(temp.path())
             .output()
@@ -678,6 +835,103 @@ mod tests {
         assert_eq!(files.len(), 1);
     }
 
+    fn write_mixed_jj_files(root: &Path) {
+        fs::write(root.join("data.json"), "{\"a\":1}\n").unwrap();
+        fs::write(root.join("lib.rs"), "fn x(){}\n").unwrap();
+        fs::write(root.join("app.py"), "x = 1\n").unwrap();
+        fs::write(root.join("cfg.yaml"), "a: 1\n").unwrap();
+        jj_cmd()
+            .args([
+                "commit",
+                "-m",
+                "mixed base",
+                "data.json",
+                "lib.rs",
+                "app.py",
+                "cfg.yaml",
+            ])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        fs::write(root.join("data.json"), "{ \"a\" : 1 }\n").unwrap();
+        fs::write(root.join("lib.rs"), "fn x(){ }\n").unwrap();
+        fs::write(root.join("app.py"), "x =  1\n").unwrap();
+        fs::write(root.join("cfg.yaml"), "a:  1\n").unwrap();
+    }
+
+    fn jj_file<'a>(files: &'a [DiffFile], path: &str) -> Option<&'a DiffFile> {
+        files
+            .iter()
+            .find(|file| file.display_path() == Path::new(path))
+    }
+
+    #[test]
+    fn test_jj_auto_whitespace_mixed_extensions_and_noop_files() {
+        let Some(temp) = setup_test_repo() else {
+            eprintln!("Skipping test: jj command not available");
+            return;
+        };
+        write_mixed_jj_files(temp.path());
+
+        let auto = JjBackend::from_path(
+            temp.path().to_path_buf(),
+            DiffWhitespaceMode::Auto(crate::vcs::WhitespaceAutoPolicy::builtin()),
+        )
+        .expect("Failed to create jj backend");
+        let files = auto
+            .get_working_tree_diff(&SyntaxHighlighter::default())
+            .expect("auto mixed jj diff");
+        let json = jj_file(&files, "data.json").expect("jj keeps noop files in metadata");
+        assert!(
+            json.hunks.is_empty(),
+            "json whitespace-only change should be a jj no-op file"
+        );
+        let rust = jj_file(&files, "lib.rs").expect("jj keeps rust noop files");
+        assert!(rust.hunks.is_empty());
+        assert!(
+            !jj_file(&files, "app.py")
+                .expect("python whitespace should remain")
+                .hunks
+                .is_empty()
+        );
+        assert!(
+            !jj_file(&files, "cfg.yaml")
+                .expect("yaml whitespace should remain")
+                .hunks
+                .is_empty()
+        );
+        assert!(
+            jj_file(&files, "hello.txt").is_some(),
+            "metadata and patch alignment should keep the original modified file"
+        );
+
+        let ignore_all =
+            JjBackend::from_path(temp.path().to_path_buf(), DiffWhitespaceMode::IgnoreAll)
+                .expect("Failed to create jj backend");
+        let files = ignore_all
+            .get_working_tree_diff(&SyntaxHighlighter::default())
+            .expect("ignore-all still has files");
+        assert!(
+            jj_file(&files, "app.py")
+                .map(|file| file.hunks.is_empty())
+                .unwrap_or(true)
+        );
+
+        let err = auto
+            .get_commit_range_diff(
+                &ResolvedRevisionRange::from_owned_commit_ids(
+                    vec!["not-a-real-revision".into()],
+                    RevisionDiffTarget::CommitList,
+                ),
+                &SyntaxHighlighter::default(),
+            )
+            .unwrap_err();
+        assert!(
+            !matches!(err, TuicrError::NoChanges),
+            "unexpected jj command failure must not look like a clean review: {err}"
+        );
+    }
+
     #[test]
     fn test_jj_fetch_context_lines() {
         let Some(temp) = setup_test_repo() else {
@@ -714,7 +968,7 @@ mod tests {
         let root = temp_dir.path();
 
         // Initialize jj repo
-        let output = Command::new("jj")
+        let output = jj_cmd()
             .args(["git", "init"])
             .current_dir(root)
             .output()
@@ -730,7 +984,7 @@ mod tests {
 
         // First commit
         fs::write(root.join("file1.txt"), "first file\n").expect("Failed to write file");
-        Command::new("jj")
+        jj_cmd()
             .args(["commit", "-m", "First commit"])
             .current_dir(root)
             .output()
@@ -738,7 +992,7 @@ mod tests {
 
         // Second commit
         fs::write(root.join("file2.txt"), "second file\n").expect("Failed to write file");
-        Command::new("jj")
+        jj_cmd()
             .args(["commit", "-m", "Second commit"])
             .current_dir(root)
             .output()
@@ -746,7 +1000,7 @@ mod tests {
 
         // Third commit - modify first file
         fs::write(root.join("file1.txt"), "first file\nmodified\n").expect("Failed to write file");
-        Command::new("jj")
+        jj_cmd()
             .args(["commit", "-m", "Third commit"])
             .current_dir(root)
             .output()
@@ -853,7 +1107,7 @@ mod tests {
         let root = temp_dir.path();
 
         // Initialize jj repo
-        let output = Command::new("jj")
+        let output = jj_cmd()
             .args(["git", "init"])
             .current_dir(root)
             .output()
@@ -865,7 +1119,7 @@ mod tests {
 
         // Create and commit a file
         fs::write(root.join("original.txt"), "file content\n").expect("Failed to write file");
-        Command::new("jj")
+        jj_cmd()
             .args(["commit", "-m", "Add original file"])
             .current_dir(root)
             .output()
@@ -912,7 +1166,7 @@ mod tests {
         let root = temp_dir.path();
 
         // Initialize jj repo
-        let output = Command::new("jj")
+        let output = jj_cmd()
             .args(["git", "init"])
             .current_dir(root)
             .output()
@@ -962,7 +1216,7 @@ mod tests {
         let root = temp.path();
 
         // Commit the binary file first
-        Command::new("jj")
+        jj_cmd()
             .args(["commit", "-m", "Add binary file"])
             .current_dir(root)
             .output()
@@ -997,7 +1251,7 @@ mod tests {
         let root = temp_dir.path();
 
         // Initialize jj repo
-        let output = Command::new("jj")
+        let output = jj_cmd()
             .args(["git", "init"])
             .current_dir(root)
             .output()
@@ -1009,14 +1263,14 @@ mod tests {
 
         // Create initial file and commit
         fs::write(root.join("file.txt"), "content\n").expect("Failed to write file");
-        Command::new("jj")
+        jj_cmd()
             .args(["commit", "-m", "Initial commit"])
             .current_dir(root)
             .output()
             .expect("Failed to commit");
 
         // Create a bookmark on @
-        Command::new("jj")
+        jj_cmd()
             .args(["bookmark", "create", "my-feature", "-r", "@"])
             .current_dir(root)
             .output()
@@ -1034,7 +1288,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
         let root = temp_dir.path();
 
-        let output = Command::new("jj")
+        let output = jj_cmd()
             .args(["git", "init"])
             .current_dir(root)
             .output()
@@ -1046,7 +1300,7 @@ mod tests {
         let initial = "<template>\n  <div>{{ msg }}</div>\n</template>\n\n<script setup>\nimport { ref } from 'vue'\nconst msg = ref('hi')\nconst other = 1\n</script>\n";
         fs::write(root.join("App.vue"), initial).expect("Failed to write Vue file");
 
-        Command::new("jj")
+        jj_cmd()
             .args(["commit", "-m", "Add Vue file"])
             .current_dir(root)
             .output()
@@ -1093,6 +1347,86 @@ mod tests {
         }
     }
 
+    /// Create a repo whose only file lives under a directory with fileset meta
+    /// characters in its name, so every `jj file show` call has to quote it.
+    fn setup_test_repo_with_meta_char_path() -> Option<(tempfile::TempDir, PathBuf)> {
+        if !jj_available() {
+            return None;
+        }
+
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let root = temp_dir.path();
+
+        let output = jj_cmd()
+            .args(["git", "init"])
+            .current_dir(root)
+            .output()
+            .expect("Failed to init jj repo");
+        if !output.status.success() {
+            return None;
+        }
+
+        // Vue so the diff goes through the container full-file highlight path,
+        // which batches paths into a single `jj file show`.
+        let rel = PathBuf::from("routes/(app)/+page.vue");
+        fs::create_dir_all(root.join(rel.parent().unwrap())).expect("Failed to create dir");
+        let initial = "<template>\n  <div>{{ msg }}</div>\n</template>\n\n<script setup>\nimport { ref } from 'vue'\nconst msg = ref('hi')\nconst other = 1\n</script>\n";
+        fs::write(root.join(&rel), initial).expect("Failed to write Vue file");
+
+        jj_cmd()
+            .args(["commit", "-m", "Add Vue file"])
+            .current_dir(root)
+            .output()
+            .expect("Failed to commit");
+
+        let edited = "<template>\n  <div>{{ msg }}</div>\n</template>\n\n<script setup>\nimport { ref } from 'vue'\nconst msg = ref('hello')\nconst other = 1\n</script>\n";
+        fs::write(root.join(&rel), edited).expect("Failed to modify Vue file");
+
+        Some((temp_dir, rel))
+    }
+
+    #[test]
+    fn test_jj_fileset_arg_quotes_meta_characters() {
+        assert_eq!(
+            jj_fileset_arg(Path::new("routes/(app)/+page.svelte")),
+            r#"root-file:"routes/(app)/+page.svelte""#
+        );
+        assert_eq!(
+            jj_fileset_arg(Path::new(r#"we"ird\name.txt"#)),
+            r#"root-file:"we\"ird\\name.txt""#
+        );
+    }
+
+    #[test]
+    fn test_jj_handles_paths_with_fileset_meta_characters() {
+        let Some((temp, rel)) = setup_test_repo_with_meta_char_path() else {
+            eprintln!("Skipping test: jj command not available");
+            return;
+        };
+
+        let backend = JjBackend::from_path(temp.path().to_path_buf(), DiffWhitespaceMode::Normal)
+            .expect("Failed to create jj backend");
+
+        // The batched `jj file show` behind container highlighting must not
+        // choke on the parentheses in the path.
+        let files = backend
+            .get_working_tree_diff(&SyntaxHighlighter::default())
+            .expect("diff should succeed for a path with fileset meta characters");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].new_path.as_deref(), Some(rel.as_path()));
+
+        let lines = backend
+            .fetch_context_lines(&rel, FileStatus::Modified, Some("@-"), 1, 2)
+            .expect("context lines should be fetchable for a meta-character path");
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].content, "<template>");
+
+        let count = backend
+            .file_line_count(&rel, FileStatus::Modified, Some("@-"))
+            .expect("line count should be readable for a meta-character path");
+        assert_eq!(count, 9);
+    }
+
     #[test]
     fn test_jj_bookmark_on_current_revision() {
         let Some(temp) = setup_test_repo_with_bookmark_on_current() else {
@@ -1121,7 +1455,7 @@ mod tests {
         let root = temp_dir.path();
 
         // Initialize jj repo
-        let output = Command::new("jj")
+        let output = jj_cmd()
             .args(["git", "init"])
             .current_dir(root)
             .output()
@@ -1133,14 +1467,14 @@ mod tests {
 
         // Create initial file and commit
         fs::write(root.join("file.txt"), "content\n").expect("Failed to write file");
-        Command::new("jj")
+        jj_cmd()
             .args(["commit", "-m", "Initial commit"])
             .current_dir(root)
             .output()
             .expect("Failed to commit");
 
         // Create a bookmark on the commit we just made (now @-)
-        Command::new("jj")
+        jj_cmd()
             .args(["bookmark", "create", "main", "-r", "@-"])
             .current_dir(root)
             .output()
@@ -1148,7 +1482,7 @@ mod tests {
 
         // Make another commit so @ is ahead of the bookmark
         fs::write(root.join("file2.txt"), "more content\n").expect("Failed to write file");
-        Command::new("jj")
+        jj_cmd()
             .args(["commit", "-m", "Second commit"])
             .current_dir(root)
             .output()
@@ -1185,7 +1519,7 @@ mod tests {
         let root = temp_dir.path();
 
         // Initialize jj repo
-        let output = Command::new("jj")
+        let output = jj_cmd()
             .args(["git", "init"])
             .current_dir(root)
             .output()
@@ -1197,7 +1531,7 @@ mod tests {
 
         // Create initial file and commit (no bookmarks)
         fs::write(root.join("file.txt"), "content\n").expect("Failed to write file");
-        Command::new("jj")
+        jj_cmd()
             .args(["commit", "-m", "Initial commit"])
             .current_dir(root)
             .output()
@@ -1222,5 +1556,47 @@ mod tests {
             "Expected no bookmark when none exist, got {:?}",
             info.branch_name
         );
+    }
+
+    #[test]
+    fn test_jj_revision_ids_are_not_colored() {
+        let Some(temp) = setup_test_repo_with_commits() else {
+            eprintln!("Skipping test: jj command not available");
+            return;
+        };
+
+        // Force color output regardless of whether stdout is a tty
+        let output = Command::new("jj")
+            .args(["config", "set", "--repo", "ui.color", "always"])
+            .current_dir(temp.path())
+            .output()
+            .expect("Failed to configure jj colors");
+
+        assert!(
+            output.status.success(),
+            "Failed to enable colors: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let backend = JjBackend::from_path(temp.path().to_path_buf(), DiffWhitespaceMode::Normal)
+            .expect("Failed to create backend");
+
+        let commits = backend
+            .get_recent_commits(0, 10)
+            .expect("Failed to get commits");
+
+        for commit in commits {
+            assert!(
+                !commit.id.contains('\x1b'),
+                "Commit id contains ANSI escapes: {:?}",
+                commit.id
+            );
+
+            assert!(
+                !commit.short_id.contains('\x1b'),
+                "Short id contains ANSI escapes: {:?}",
+                commit.short_id
+            );
+        }
     }
 }

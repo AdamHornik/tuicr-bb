@@ -104,6 +104,36 @@ fn app_with_root(root_path: PathBuf, files: Vec<DiffFile>) -> App {
 }
 
 #[test]
+fn collapsing_selected_directory_keeps_tree_selection() {
+    let mut app = app_with(vec![
+        file("README.md", vec![hunk(1, 1)]),
+        file("src/app.rs", vec![hunk(1, 1)]),
+        file("src/main.rs", vec![hunk(1, 1)]),
+    ]);
+    app.expand_all_dirs();
+
+    let tree_idx = app
+        .build_visible_items()
+        .iter()
+        .position(|item| {
+            matches!(
+                item,
+                FileTreeItem::Directory { path, .. } if path == "src"
+            )
+        })
+        .expect("src directory");
+    app.file_list_state.select(tree_idx);
+
+    app.toggle_directory("src");
+
+    assert_eq!(app.file_list_state.selected(), tree_idx);
+    assert!(matches!(
+        app.get_selected_tree_item(),
+        Some(FileTreeItem::Directory { path, .. }) if path == "src"
+    ));
+}
+
+#[test]
 fn editor_target_uses_selected_file_list_row() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("main.rs");
@@ -195,8 +225,35 @@ fn editor_target_warns_for_missing_local_file() {
     );
 }
 
+/// Content the fake backend serves for a revision.
+///
+/// Echoing the SHA back lets a test assert *which* revision (and therefore
+/// which diff side) the editor target was resolved against.
+fn revision_content(sha: &str) -> String {
+    format!("content at {sha}\n")
+}
+
 struct FakeForgeBackend {
     local_checkout: Option<PathBuf>,
+    /// When set, `fetch_file_content` fails with this message instead of
+    /// serving `revision_content`.
+    error: Option<String>,
+}
+
+impl FakeForgeBackend {
+    fn serving(local_checkout: Option<PathBuf>) -> Self {
+        Self {
+            local_checkout,
+            error: None,
+        }
+    }
+
+    fn failing(message: &str) -> Self {
+        Self {
+            local_checkout: None,
+            error: Some(message.to_string()),
+        }
+    }
 }
 
 impl crate::forge::traits::ForgeBackend for FakeForgeBackend {
@@ -215,7 +272,7 @@ impl crate::forge::traits::ForgeBackend for FakeForgeBackend {
     fn get_pull_request_diff(
         &self,
         _pr: &crate::forge::traits::PullRequestDetails,
-    ) -> crate::error::Result<String> {
+    ) -> crate::error::Result<Vec<crate::model::FilePatch>> {
         unimplemented!()
     }
     fn fetch_file_lines(
@@ -241,7 +298,7 @@ impl crate::forge::traits::ForgeBackend for FakeForgeBackend {
         _pr: &crate::forge::traits::PullRequestDetails,
         _start_sha: &str,
         _end_sha: &str,
-    ) -> crate::error::Result<String> {
+    ) -> crate::error::Result<Vec<crate::model::FilePatch>> {
         unimplemented!()
     }
     fn create_review(
@@ -251,41 +308,118 @@ impl crate::forge::traits::ForgeBackend for FakeForgeBackend {
     ) -> crate::error::Result<crate::forge::traits::GhCreateReviewResponse> {
         unimplemented!()
     }
+    fn fetch_file_content(
+        &self,
+        request: crate::forge::traits::ForgeFileLinesRequest,
+    ) -> crate::error::Result<String> {
+        match &self.error {
+            Some(message) => Err(crate::error::TuicrError::Forge(message.clone())),
+            None => Ok(revision_content(request.sha())),
+        }
+    }
     fn local_checkout_path(&self) -> Option<PathBuf> {
         self.local_checkout.clone()
     }
 }
 
+/// PR review app over `files`, with a synthetic root as PR mode really has.
+///
+/// These cases deliberately stop short of writing a revision snapshot — that
+/// would land in the real temp dir and outlive the run — so
+/// `editor_target::materialize` and friends are covered by their own unit tests
+/// instead.
+fn pr_app(backend: FakeForgeBackend, files: Vec<DiffFile>) -> (App, String, String) {
+    let head_sha = "1a2b3c4d5e6f7a8b".to_string();
+    let base_sha = "9f8e7d6c5b4a3928".to_string();
+    let mut app = app_with_root(PathBuf::from("forge:github.com/agavra/tuicr"), files);
+    app.diff_source = DiffSource::PullRequest(Box::new(PullRequestDiffSource {
+        key: crate::forge::traits::PrSessionKey::new(
+            crate::forge::traits::ForgeRepository::github("github.com", "agavra", "tuicr"),
+            7,
+            head_sha.clone(),
+        ),
+        base_sha: base_sha.clone(),
+        title: "a pull request".to_string(),
+        url: "https://github.com/agavra/tuicr/pull/7".to_string(),
+        head_ref_name: "feature".to_string(),
+        base_ref_name: "main".to_string(),
+        state: "OPEN".to_string(),
+        closed: false,
+        merged: false,
+    }));
+    app.forge_backend = Some(Box::new(backend));
+    app.focused_panel = FocusedPanel::FileList;
+    (app, head_sha, base_sha)
+}
+
 #[test]
-fn editor_target_falls_back_to_forge_backend_checkout_in_pr_mode() {
+fn pr_editor_target_prefers_a_worktree_copy_of_the_pr_revision() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("main.rs");
-    fs::write(&path, "fn main() {}\n").expect("write file");
 
-    let mut app = app_with_root(
-        PathBuf::from("forge:github.com/agavra/tuicr"),
+    let (mut app, head_sha, _) = pr_app(
+        FakeForgeBackend::serving(Some(dir.path().to_path_buf())),
         vec![file("main.rs", vec![hunk(1, 1)])],
     );
-    app.forge_backend = Some(Box::new(FakeForgeBackend {
-        local_checkout: Some(dir.path().to_path_buf()),
-    }));
-    app.focused_panel = FocusedPanel::FileList;
+    // The checkout holds exactly the reviewed content, so the editor should get
+    // the real file — the only copy edits can land in.
+    fs::write(&path, revision_content(&head_sha)).expect("write file");
 
     app.queue_editor_for_focused_item();
 
     let target = app.take_pending_editor_target().expect("editor target");
     assert_eq!(target.path, path);
+    assert_eq!(target.label, "main.rs");
 }
 
 #[test]
-fn editor_target_warns_when_pr_mode_has_no_matching_checkout() {
+fn pr_editor_target_warns_when_a_binary_file_is_not_in_the_checkout() {
+    let mut binary = file("logo.png", vec![hunk(1, 1)]);
+    binary.is_binary = true;
+    let (mut app, _, _) = pr_app(FakeForgeBackend::serving(None), vec![binary]);
+
+    app.queue_editor_for_focused_item();
+
+    assert!(app.take_pending_editor_target().is_none());
+    assert!(
+        app.message
+            .as_ref()
+            .expect("warning")
+            .content
+            .contains("binary file"),
+        "{:?}",
+        app.message
+    );
+}
+
+#[test]
+fn pr_editor_target_warns_with_the_forge_error() {
+    let (mut app, _, _) = pr_app(
+        FakeForgeBackend::failing("HTTP 404: no such path"),
+        vec![file("main.rs", vec![hunk(1, 1)])],
+    );
+
+    app.queue_editor_for_focused_item();
+
+    assert!(app.take_pending_editor_target().is_none());
+    assert!(
+        app.message
+            .as_ref()
+            .expect("warning")
+            .content
+            .contains("HTTP 404: no such path"),
+        "{:?}",
+        app.message
+    );
+}
+
+#[test]
+fn editor_target_warns_when_a_synthetic_root_has_no_checkout() {
+    // Not PR mode: nothing can resolve the synthetic root to a directory.
     let mut app = app_with_root(
         PathBuf::from("forge:github.com/agavra/tuicr"),
         vec![file("main.rs", vec![hunk(1, 1)])],
     );
-    app.forge_backend = Some(Box::new(FakeForgeBackend {
-        local_checkout: None,
-    }));
     app.focused_panel = FocusedPanel::FileList;
 
     app.queue_editor_for_focused_item();
@@ -499,4 +633,37 @@ fn effective_file_height_is_zero_for_non_current_in_single_file_view() {
     assert_eq!(app.effective_file_height(1, other), 0);
     let current = &app.diff_files[0].clone();
     assert!(app.effective_file_height(0, current) > 0);
+}
+
+#[test]
+fn reviewed_banner_keeps_annotations_aligned_with_rendered_rows() {
+    let mut app = app_with(vec![file("a.rs", vec![hunk(1, 3)])]);
+    app.toggle_single_file_view();
+
+    let before = app.line_annotations.len();
+    app.toggle_reviewed();
+
+    // Single-file view renders the focused file under a "Marked reviewed"
+    // banner, so both the annotation stream and the height model grow by
+    // exactly that one row.
+    assert!(app.session.is_file_reviewed(&PathBuf::from("a.rs")));
+    assert_eq!(app.line_annotations.len(), before + 1);
+    assert_eq!(app.line_annotations.len(), app.total_lines());
+    assert!(matches!(
+        app.line_annotations.first(),
+        Some(AnnotatedLine::ReviewedBanner { file_idx: 0 })
+    ));
+    assert!(matches!(
+        app.line_annotations.get(1),
+        Some(AnnotatedLine::HunkHeader { .. })
+    ));
+
+    // With the banner occupying row 0, moving down from it lands on the
+    // hunk header the renderer draws directly beneath it.
+    app.diff_state.cursor_line = 0;
+    app.cursor_down(1);
+    assert!(matches!(
+        app.line_annotations.get(app.diff_state.cursor_line),
+        Some(AnnotatedLine::HunkHeader { .. })
+    ));
 }

@@ -133,6 +133,379 @@ fn hunk_diff_line(app: &App, file_idx: usize, hunk_idx: usize) -> usize {
         .expect("missing hunk diff annotation")
 }
 
+fn assert_hunk_jumps_follow_rendered_headers(app: &mut App) {
+    let headers: Vec<_> = app
+        .line_annotations
+        .iter()
+        .enumerate()
+        .filter_map(|(row, line)| matches!(line, AnnotatedLine::HunkHeader { .. }).then_some(row))
+        .collect();
+    assert!(headers.len() >= 2);
+    assert_eq!(app.hunk_positions(), headers);
+    for pair in headers.windows(2) {
+        app.diff_state.cursor_line = pair[0];
+        app.next_hunk();
+        assert_eq!(app.diff_state.cursor_line, pair[1]);
+        app.prev_hunk();
+        assert_eq!(app.diff_state.cursor_line, pair[0]);
+    }
+}
+
+#[test]
+fn hunk_navigation_tracks_expanded_and_collapsed_context() {
+    for mode in [DiffViewMode::Unified, DiffViewMode::SideBySide] {
+        for single in [false, true] {
+            let file = make_file_with_hunks("test.rs", vec![make_hunk(1, 5), make_hunk(50, 5)]);
+            let mut app = build_app_with_files(vec![file], 100);
+            app.diff_view_mode = mode;
+            app.is_single_file_view = single;
+            app.rebuild_annotations();
+            let gap = GapId {
+                file_idx: 0,
+                hunk_idx: 1,
+            };
+            for (direction, count) in [
+                (ExpandDirection::Down, Some(20)),
+                (ExpandDirection::Up, Some(10)),
+                (ExpandDirection::Both, None),
+            ] {
+                app.expand_gap(gap.clone(), direction, count).unwrap();
+                assert_hunk_jumps_follow_rendered_headers(&mut app);
+            }
+            app.collapse_gap(gap);
+            assert_hunk_jumps_follow_rendered_headers(&mut app);
+        }
+    }
+}
+
+#[test]
+fn hunk_navigation_counts_paired_changes_and_wrapped_comments() {
+    for mode in [DiffViewMode::Unified, DiffViewMode::SideBySide] {
+        let mut first = make_hunk(1, 2);
+        first.lines = vec![
+            DiffLine {
+                origin: LineOrigin::Deletion,
+                content: "before".into(),
+                old_lineno: Some(1),
+                new_lineno: None,
+                highlighted_spans: None,
+            },
+            DiffLine {
+                origin: LineOrigin::Addition,
+                content: "after".into(),
+                old_lineno: None,
+                new_lineno: Some(1),
+                highlighted_spans: None,
+            },
+            DiffLine {
+                origin: LineOrigin::Context,
+                content: "unchanged".into(),
+                old_lineno: Some(2),
+                new_lineno: Some(2),
+                highlighted_spans: None,
+            },
+        ];
+        let file = make_file_with_hunks("test.rs", vec![first, make_hunk(50, 5)]);
+        let mut app = build_app_with_files(vec![file], 100);
+        app.diff_view_mode = mode;
+        app.diff_state.viewport_width = 40;
+        let path = app.diff_files[0].display_path().clone();
+        app.session.get_file_mut(&path).unwrap().add_line_comment(
+            1,
+            Comment::new(
+                "A long comment that wraps over several rendered rows.\nAnother line.".into(),
+                CommentType::from_id("note"),
+                Some(LineSide::New),
+            ),
+        );
+        app.session
+            .get_file_mut(&path)
+            .unwrap()
+            .add_file_comment(Comment::new(
+                "file comment\nsecond line".into(),
+                CommentType::from_id("note"),
+                None,
+            ));
+        app.rebuild_annotations();
+        assert_hunk_jumps_follow_rendered_headers(&mut app);
+    }
+}
+
+#[test]
+fn hunk_navigation_renders_the_target_after_scrolling_expanded_context() {
+    use ratatui::{Terminal, backend::TestBackend};
+    for mode in [DiffViewMode::Unified, DiffViewMode::SideBySide] {
+        let file = make_file_with_hunks("test.rs", vec![make_hunk(1, 5), make_hunk(50, 5)]);
+        let mut app = build_app_with_files(vec![file], 100);
+        app.diff_view_mode = mode;
+        app.expand_gap(
+            GapId {
+                file_idx: 0,
+                hunk_idx: 1,
+            },
+            ExpandDirection::Both,
+            None,
+        )
+        .unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(100, 10)).unwrap();
+        let draw = |terminal: &mut Terminal<TestBackend>, app: &mut App| {
+            terminal
+                .draw(|frame| crate::ui::render(frame, app))
+                .unwrap();
+        };
+        draw(&mut terminal, &mut app);
+        app.diff_state.cursor_line = 1;
+        app.next_hunk();
+        draw(&mut terminal, &mut app);
+        assert!(app.diff_state.scroll_offset > 0);
+        assert!(
+            app.diff_row_to_annotation
+                .contains(&app.diff_state.cursor_line)
+        );
+        assert!(matches!(
+            app.line_annotations[app.diff_state.cursor_line],
+            AnnotatedLine::HunkHeader {
+                file_idx: 0,
+                hunk_idx: 1
+            }
+        ));
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(screen.contains("@@ -50,5 +50,5 @@"), "{mode:?}: {screen}");
+        app.prev_hunk();
+        draw(&mut terminal, &mut app);
+        assert!(
+            app.diff_row_to_annotation
+                .contains(&app.diff_state.cursor_line)
+        );
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(screen.contains("@@ -1,5 +1,5 @@"), "{mode:?}: {screen}");
+    }
+}
+
+#[test]
+fn hunk_navigation_crosses_asymmetric_files_with_hidden_middle_file() {
+    for mode in [DiffViewMode::Unified, DiffViewMode::SideBySide] {
+        let files = vec![
+            make_file_with_hunks("a.rs", vec![make_hunk(1, 5), make_hunk(50, 5)]),
+            make_file_with_hunks("hidden.rs", vec![make_hunk(1, 5)]),
+            make_file_with_hunks("z.rs", vec![make_hunk(30, 3)]),
+        ];
+        let mut app = build_app_with_files(files, 100);
+        app.diff_view_mode = mode;
+        let hidden = app.diff_files[1].display_path().clone();
+        app.session.get_file_mut(&hidden).unwrap().reviewed = true;
+        app.set_show_reviewed(false);
+        let last_path = app.diff_files[2].display_path().clone();
+        app.session
+            .get_file_mut(&last_path)
+            .unwrap()
+            .add_file_comment(Comment::new(
+                "first line\nsecond line".into(),
+                CommentType::from_id("note"),
+                None,
+            ));
+        app.is_single_file_view = true;
+        app.rebuild_annotations();
+        app.diff_state.cursor_line = app
+            .line_annotations
+            .iter()
+            .position(|line| {
+                matches!(
+                    line,
+                    AnnotatedLine::HunkHeader {
+                        file_idx: 0,
+                        hunk_idx: 1
+                    }
+                )
+            })
+            .unwrap();
+        app.next_hunk();
+        assert_eq!(app.diff_state.current_file_idx, 2);
+        assert!(matches!(
+            app.line_annotations[app.diff_state.cursor_line],
+            AnnotatedLine::HunkHeader {
+                file_idx: 2,
+                hunk_idx: 0
+            }
+        ));
+        app.prev_hunk();
+        assert_eq!(app.diff_state.current_file_idx, 0);
+        assert!(matches!(
+            app.line_annotations[app.diff_state.cursor_line],
+            AnnotatedLine::HunkHeader {
+                file_idx: 0,
+                hunk_idx: 1
+            }
+        ));
+    }
+}
+
+#[test]
+fn should_cycle_forward_through_review_file_and_line_comments() {
+    let file = make_file_with_hunks("test.rs", vec![make_hunk(1, 3)]);
+    let mut app = build_app_with_files(vec![file], 20);
+    app.diff_state.viewport_height = 4;
+    app.session.review_comments.push(Comment::new(
+        "review".to_string(),
+        CommentType::from_id("note"),
+        None,
+    ));
+    let path = app.diff_files[0].display_path().clone();
+    let review = app.session.get_file_mut(&path).unwrap();
+    review.add_file_comment(Comment::new(
+        "file".to_string(),
+        CommentType::from_id("suggestion"),
+        None,
+    ));
+    review.add_line_comment(
+        2,
+        Comment::new(
+            "line".to_string(),
+            CommentType::from_id("issue"),
+            Some(LineSide::New),
+        ),
+    );
+    app.rebuild_annotations();
+
+    app.diff_state.cursor_line = 0;
+
+    app.next_comment();
+    let first_comment = app.diff_state.cursor_line;
+    assert!(matches!(
+        app.line_annotations.get(app.diff_state.cursor_line),
+        Some(AnnotatedLine::ReviewComment { comment_idx: 0 })
+    ));
+
+    app.next_comment();
+    assert!(matches!(
+        app.line_annotations.get(app.diff_state.cursor_line),
+        Some(AnnotatedLine::FileComment {
+            file_idx: 0,
+            comment_idx: 0
+        })
+    ));
+
+    app.next_comment();
+    assert!(matches!(
+        app.line_annotations.get(app.diff_state.cursor_line),
+        Some(AnnotatedLine::LineComment {
+            file_idx: 0,
+            line: 2,
+            side: LineSide::New,
+            comment_idx: 0
+        })
+    ));
+
+    app.next_comment();
+    assert_eq!(app.diff_state.cursor_line, first_comment);
+}
+
+#[test]
+fn should_cycle_backward_and_skip_current_multiline_comment() {
+    let file = make_file_with_hunks("test.rs", vec![make_hunk(1, 3)]);
+    let mut app = build_app_with_files(vec![file], 20);
+    app.session.review_comments.push(Comment::new(
+        "review".to_string(),
+        CommentType::from_id("note"),
+        None,
+    ));
+    let path = app.diff_files[0].display_path().clone();
+    let review = app.session.get_file_mut(&path).unwrap();
+    review.add_file_comment(Comment::new(
+        "file\nbody".to_string(),
+        CommentType::from_id("suggestion"),
+        None,
+    ));
+    review.add_line_comment(
+        2,
+        Comment::new(
+            "line".to_string(),
+            CommentType::from_id("issue"),
+            Some(LineSide::New),
+        ),
+    );
+    app.rebuild_annotations();
+
+    let file_comment = app
+        .line_annotations
+        .iter()
+        .position(|line| {
+            matches!(
+                line,
+                AnnotatedLine::FileComment {
+                    file_idx: 0,
+                    comment_idx: 0
+                }
+            )
+        })
+        .expect("missing annotation");
+    app.diff_state.cursor_line = file_comment + 2;
+
+    app.prev_comment();
+
+    assert!(matches!(
+        app.line_annotations.get(app.diff_state.cursor_line),
+        Some(AnnotatedLine::ReviewComment { comment_idx: 0 })
+    ));
+}
+
+#[test]
+fn should_wrap_backward_to_last_comment() {
+    let file = make_file_with_hunks("test.rs", vec![make_hunk(1, 3)]);
+    let mut app = build_app_with_files(vec![file], 20);
+    let path = app.diff_files[0].display_path().clone();
+    let review = app.session.get_file_mut(&path).unwrap();
+    review.add_file_comment(Comment::new(
+        "file".to_string(),
+        CommentType::from_id("suggestion"),
+        None,
+    ));
+    review.add_line_comment(
+        2,
+        Comment::new(
+            "line".to_string(),
+            CommentType::from_id("issue"),
+            Some(LineSide::New),
+        ),
+    );
+    app.rebuild_annotations();
+    app.diff_state.cursor_line = 0;
+
+    app.prev_comment();
+
+    assert!(matches!(
+        app.line_annotations.get(app.diff_state.cursor_line),
+        Some(AnnotatedLine::LineComment {
+            file_idx: 0,
+            line: 2,
+            side: LineSide::New,
+            comment_idx: 0
+        })
+    ));
+}
+
+#[test]
+fn should_report_when_no_comments_exist() {
+    let file = make_file_with_hunks("test.rs", vec![make_hunk(1, 3)]);
+    let mut app = build_app_with_files(vec![file], 20);
+
+    app.next_comment();
+
+    assert_eq!(app.message.as_ref().unwrap().content, "No comments");
+}
+
 #[test]
 fn should_toggle_hunk_reviewed_from_header() {
     let file = make_file_with_hunks("test.rs", vec![make_hunk(1, 3)]);
@@ -1150,6 +1523,104 @@ fn jump_to_selected_comment_uses_comment_annotation_target() {
     assert_eq!(app.diff_state.cursor_line, target);
     assert_eq!(app.diff_state.scroll_offset, expected_scroll);
     assert_eq!(app.focused_panel, FocusedPanel::Diff);
+}
+
+#[test]
+fn should_update_current_file_when_navigating_to_remote_comment() {
+    use crate::forge::remote_comments::{
+        RemoteCommentSide, RemoteReviewComment, RemoteReviewThread,
+    };
+
+    let files = vec![
+        make_file_with_hunks("a.rs", vec![make_hunk(1, 1)]),
+        make_file_with_hunks("b.rs", vec![make_hunk(1, 2)]),
+    ];
+    let mut app = build_app_with_files(files, 10);
+    app.forge_review_threads = vec![RemoteReviewThread {
+        id: "T1".into(),
+        path: "b.rs".into(),
+        line: Some(2),
+        side: RemoteCommentSide::Right,
+        is_resolved: false,
+        is_outdated: false,
+        comments: vec![RemoteReviewComment {
+            id: "C1".into(),
+            author: Some("alice".into()),
+            body: "remote-thread".into(),
+            created_at: None,
+            in_reply_to: None,
+            url: "https://example.com/c1".into(),
+        }],
+    }];
+    app.rebuild_annotations();
+    app.diff_state.current_file_idx = 0;
+    app.diff_state.cursor_line = 0;
+
+    app.next_comment();
+
+    assert!(matches!(
+        app.line_annotations.get(app.diff_state.cursor_line),
+        Some(AnnotatedLine::RemoteThreadLine { thread_idx: 0, .. })
+    ));
+    assert_eq!(app.diff_state.current_file_idx, 1);
+
+    app.toggle_reviewed();
+
+    assert!(!app.session.is_file_reviewed(&PathBuf::from("a.rs")));
+    assert!(app.session.is_file_reviewed(&PathBuf::from("b.rs")));
+}
+
+#[test]
+fn should_rebuild_single_file_annotations_when_navigating_to_outdated_remote_comment() {
+    use crate::forge::remote_comments::{
+        PrCommentsVisibility, RemoteCommentSide, RemoteReviewComment, RemoteReviewThread,
+    };
+
+    let files = vec![
+        make_file_with_hunks("a.rs", vec![make_hunk(1, 1)]),
+        make_file_with_hunks("b.rs", vec![make_hunk(1, 2)]),
+    ];
+    let mut app = build_app_with_files(files, 10);
+    app.is_single_file_view = true;
+    app.diff_state.current_file_idx = 0;
+    app.session.remote_comments_visibility = PrCommentsVisibility::All;
+    app.forge_review_threads = vec![RemoteReviewThread {
+        id: "T1".into(),
+        path: "b.rs".into(),
+        line: None,
+        side: RemoteCommentSide::Right,
+        is_resolved: false,
+        is_outdated: true,
+        comments: vec![RemoteReviewComment {
+            id: "C1".into(),
+            author: Some("alice".into()),
+            body: "outdated-thread".into(),
+            created_at: None,
+            in_reply_to: None,
+            url: "https://example.com/c1".into(),
+        }],
+    }];
+    app.rebuild_annotations();
+    app.diff_state.cursor_line = 0;
+
+    app.next_comment();
+
+    assert!(matches!(
+        app.line_annotations.get(app.diff_state.cursor_line),
+        Some(AnnotatedLine::RemoteThreadLine { thread_idx: 0, .. })
+    ));
+    assert_eq!(app.diff_state.current_file_idx, 1);
+    assert!(
+        app.line_annotations
+            .iter()
+            .any(|line| { matches!(line, AnnotatedLine::DiffLine { file_idx: 1, .. }) })
+    );
+    assert!(
+        !app.line_annotations
+            .iter()
+            .any(|line| { matches!(line, AnnotatedLine::DiffLine { file_idx: 0, .. }) })
+    );
+    assert_eq!(app.total_lines(), app.line_annotations.len());
 }
 
 #[test]

@@ -1,10 +1,10 @@
 use super::*;
+use crate::ui::row_height::annotation_row_height;
 
 impl App {
     pub fn cursor_down(&mut self, lines: usize) {
         let max_line = self.max_cursor_line();
         let prev_cursor = self.diff_state.cursor_line;
-        let prev_scroll = self.diff_state.scroll_offset;
         let target = self.diff_state.cursor_line + lines;
         // Single-file view: first overflow press arms `primed_walk_next`
         // and parks the cursor on max. On kitty terminals the walk
@@ -47,13 +47,10 @@ impl App {
         }
         self.diff_state.cursor_line = target.min(max_line);
         if self.diff_state.cursor_line != prev_cursor {
+            // Nothing caps how far the scroll moves. When lines wrap, one
+            // logical line covers several rows, so a single `j` can need a
+            // multi-row jump to bring the cursor back into view.
             self.ensure_cursor_visible();
-            // Cap scroll change to cursor movement to prevent multi-line jumps
-            // when the view is catching up from a non-steady-state position.
-            let cursor_moved = self.diff_state.cursor_line - prev_cursor;
-            if self.diff_state.scroll_offset > prev_scroll + cursor_moved {
-                self.diff_state.scroll_offset = prev_scroll + cursor_moved;
-            }
         }
         self.update_current_file_from_cursor();
     }
@@ -132,6 +129,88 @@ impl App {
         self.update_current_file_from_cursor();
     }
 
+    pub fn page_down(&mut self, row_budget: usize) {
+        let cursor_lines = self.page_lines_down(row_budget);
+        let viewport_lines = self.page_view_lines_down(row_budget);
+        let max_line = self.max_cursor_line();
+        let cursor = skip_decoration_forward(
+            &self.line_annotations,
+            (self.diff_state.cursor_line + cursor_lines).min(max_line),
+            max_line,
+        );
+        let scroll = (self.diff_state.scroll_offset + viewport_lines).min(self.max_scroll_offset());
+        self.apply_page_position(cursor, scroll, true);
+    }
+
+    pub fn page_up(&mut self, row_budget: usize) {
+        let cursor_lines = self.page_lines_up(row_budget);
+        let viewport_lines = self.page_view_lines_up(row_budget);
+        let cursor = skip_decoration_backward(
+            &self.line_annotations,
+            self.diff_state.cursor_line.saturating_sub(cursor_lines),
+        );
+        let scroll = self.diff_state.scroll_offset.saturating_sub(viewport_lines);
+        self.apply_page_position(cursor, scroll, false);
+    }
+
+    fn apply_page_position(&mut self, cursor: usize, scroll: usize, moving_down: bool) {
+        // A trailing Spacing annotation is not a valid cursor row. Do not let
+        // a page motion leave it alone at the top with the cursor off-screen.
+        let scroll = scroll.min(self.max_cursor_line());
+        self.diff_state.scroll_offset = scroll;
+
+        // Cursor and viewport consume their row budgets from different
+        // anchors. If a tall row causes their greedy walks to land on
+        // opposite sides of a wrap boundary, keep the independently
+        // calculated viewport position and clamp the cursor into it.
+        let first = scroll;
+        let last = self.last_fully_visible_annotation(first);
+        let mut cursor = cursor.clamp(first, last);
+        if self.line_annotations.get(cursor).is_some_and(is_decoration) {
+            cursor = if moving_down {
+                let forward = skip_decoration_forward(&self.line_annotations, cursor, last);
+                if self
+                    .line_annotations
+                    .get(forward)
+                    .is_some_and(|annotation| !is_decoration(annotation))
+                {
+                    forward
+                } else {
+                    skip_decoration_backward(&self.line_annotations, last).max(first)
+                }
+            } else {
+                let backward = skip_decoration_backward(&self.line_annotations, cursor).max(first);
+                if self
+                    .line_annotations
+                    .get(backward)
+                    .is_some_and(|annotation| !is_decoration(annotation))
+                {
+                    backward
+                } else {
+                    skip_decoration_forward(&self.line_annotations, first, last)
+                }
+            };
+        }
+
+        self.diff_state.cursor_line = cursor;
+        self.update_current_file_from_cursor();
+    }
+
+    fn last_fully_visible_annotation(&self, start: usize) -> usize {
+        let viewport = self.diff_state.viewport_height.max(1);
+        let mut used = 0;
+        let mut last = start;
+        for idx in start..self.line_annotations.len() {
+            let height = annotation_row_height(self, idx);
+            if used + height > viewport {
+                break;
+            }
+            used += height;
+            last = idx;
+        }
+        last
+    }
+
     pub fn scroll_view_down(&mut self, lines: usize) {
         let max_scroll = self.max_scroll_offset();
         self.diff_state.scroll_offset = (self.diff_state.scroll_offset + lines).min(max_scroll);
@@ -165,14 +244,60 @@ impl App {
         self.diff_state.scroll_x = self.diff_state.scroll_x.saturating_sub(cols);
     }
 
+    /// Whether the diff is focused and split into two commentable panes, so
+    /// the `<leader>` panel walk has a step to take inside it.
+    fn diff_panes_are_walkable(&self) -> bool {
+        self.focused_panel == FocusedPanel::Diff && self.diff_view_mode == DiffViewMode::SideBySide
+    }
+
+    /// `<leader>h` — move focus one panel left. In side-by-side view the two
+    /// diff columns are stops on that walk, so the order is
+    /// file list → old → new; from the new side this only steps to the old one.
+    pub fn focus_pane_left(&mut self) {
+        if self.diff_panes_are_walkable() && self.cursor_side == LineSide::New {
+            self.set_cursor_side(LineSide::Old);
+            return;
+        }
+        if self.show_file_list {
+            self.focused_panel = FocusedPanel::FileList;
+        }
+    }
+
+    /// `<leader>l` — move focus one panel right; the mirror of
+    /// [`focus_pane_left`]. Entering the diff from the file list keeps
+    /// whichever side was already active rather than resetting it.
+    pub fn focus_pane_right(&mut self) {
+        if self.diff_panes_are_walkable() {
+            if self.cursor_side == LineSide::Old {
+                self.set_cursor_side(LineSide::New);
+            }
+            return;
+        }
+        self.focused_panel = FocusedPanel::Diff;
+    }
+
+    /// Set the side the cursor targets in side-by-side view (drives the caret
+    /// and which side a new comment attaches to).
+    pub fn set_cursor_side(&mut self, side: LineSide) {
+        self.cursor_side = side;
+    }
+
     pub fn scroll_right(&mut self, cols: usize) {
         if self.diff_state.wrap_lines {
             return;
         }
+        let viewport_width = if self.diff_view_mode == DiffViewMode::SideBySide {
+            self.diff_state
+                .viewport_width
+                .saturating_sub(crate::app::sbs_overhead(self.lineno_width()) as usize)
+                / 2
+        } else {
+            self.diff_state.viewport_width
+        };
         let max_scroll_x = self
             .diff_state
             .max_content_width
-            .saturating_sub(self.diff_state.viewport_width);
+            .saturating_sub(viewport_width);
         self.diff_state.scroll_x =
             (self.diff_state.scroll_x.saturating_add(cols)).min(max_scroll_x);
     }
@@ -223,14 +348,76 @@ impl App {
         }
     }
 
+    pub(in crate::app) fn scroll_offset_for_rows_above(
+        &self,
+        anchor: usize,
+        row_budget: usize,
+    ) -> usize {
+        let mut result = anchor;
+        let mut acc: usize = 0;
+        let mut k = anchor;
+        while k > 0 {
+            k -= 1;
+            let h = annotation_row_height(self, k);
+            if acc + h > row_budget {
+                break;
+            }
+            acc += h;
+            result = k;
+        }
+        result
+    }
+
+    pub(crate) fn page_lines_down(&self, row_budget: usize) -> usize {
+        let anchor = self.diff_state.cursor_line;
+        let total = self.line_annotations.len();
+        let mut acc: usize = 0;
+        let mut count: usize = 0;
+        let mut k = anchor + 1;
+        while k < total {
+            let h = annotation_row_height(self, k);
+            if acc + h > row_budget {
+                break;
+            }
+            acc += h;
+            count += 1;
+            k += 1;
+        }
+        count.max(1)
+    }
+
+    pub(crate) fn page_lines_up(&self, row_budget: usize) -> usize {
+        let anchor = self.diff_state.cursor_line;
+        (anchor - self.scroll_offset_for_rows_above(anchor, row_budget)).max(1)
+    }
+
+    pub(crate) fn page_view_lines_down(&self, row_budget: usize) -> usize {
+        let total = self.line_annotations.len();
+        let mut used = 0;
+        let mut count = 0;
+        let mut idx = self.diff_state.scroll_offset;
+        while idx < total {
+            let height = annotation_row_height(self, idx);
+            if used + height > row_budget {
+                break;
+            }
+            used += height;
+            count += 1;
+            idx += 1;
+        }
+        count.max(1)
+    }
+
+    pub(crate) fn page_view_lines_up(&self, row_budget: usize) -> usize {
+        let anchor = self.diff_state.scroll_offset;
+        (anchor - self.scroll_offset_for_rows_above(anchor, row_budget)).max(1)
+    }
+
     pub fn center_cursor(&mut self) {
         let viewport = self.diff_state.viewport_height.max(1);
-        let half_viewport = viewport / 2;
         let max_scroll = self.max_scroll_offset();
         self.diff_state.scroll_offset = self
-            .diff_state
-            .cursor_line
-            .saturating_sub(half_viewport)
+            .scroll_offset_for_rows_above(self.diff_state.cursor_line, viewport / 2)
             .min(max_scroll);
     }
 
@@ -238,20 +425,18 @@ impl App {
         let scroll_margin = self.diff_state.effective_scroll_margin(self.scroll_offset);
         let max_scroll = self.max_scroll_offset();
         self.diff_state.scroll_offset = self
-            .diff_state
-            .cursor_line
-            .saturating_sub(scroll_margin)
+            .scroll_offset_for_rows_above(self.diff_state.cursor_line, scroll_margin)
             .min(max_scroll);
     }
 
     pub fn cursor_to_bottom(&mut self) {
-        let visible_lines = self.diff_state.effective_visible_lines();
+        let viewport = self.diff_state.viewport_height.max(1);
         let scroll_margin = self.diff_state.effective_scroll_margin(self.scroll_offset);
+        let cursor = self.diff_state.cursor_line;
+        let budget = viewport.saturating_sub(scroll_margin + annotation_row_height(self, cursor));
         let max_scroll = self.max_scroll_offset();
         self.diff_state.scroll_offset = self
-            .diff_state
-            .cursor_line
-            .saturating_sub(visible_lines.saturating_sub(1 + scroll_margin))
+            .scroll_offset_for_rows_above(cursor, budget)
             .min(max_scroll);
     }
 
@@ -381,8 +566,14 @@ impl App {
         let viewport = self.diff_state.viewport_height.max(1);
         if idx < self.diff_state.scroll_offset {
             self.diff_state.scroll_offset = idx;
-        } else if idx >= self.diff_state.scroll_offset + viewport {
-            self.diff_state.scroll_offset = idx + 1 - viewport;
+        } else {
+            let bottom_start = self.scroll_offset_for_rows_above(
+                idx,
+                viewport.saturating_sub(annotation_row_height(self, idx)),
+            );
+            if self.diff_state.scroll_offset < bottom_start {
+                self.diff_state.scroll_offset = bottom_start;
+            }
         }
     }
 
@@ -470,7 +661,12 @@ impl App {
             .copied()
             .max()
             .unwrap_or(0);
-        lineno_width(hunk_max.max(cache_max))
+        let relative_max = if self.relative_line_numbers {
+            self.line_annotations.len().saturating_sub(1) as u32
+        } else {
+            0
+        };
+        lineno_width(hunk_max.max(cache_max).max(relative_max))
     }
 
     pub fn pane_geometry(&self, inner: ratatui::layout::Rect, side: LineSide) -> PaneGeom {
@@ -625,11 +821,20 @@ impl App {
         self.diff_state.cursor_line = max_line;
         // Position so the last navigable line is at the bottom of the viewport
         let viewport = self.diff_state.viewport_height.max(1);
-        self.diff_state.scroll_offset = (max_line + 1).saturating_sub(viewport);
+        self.diff_state.scroll_offset = self.scroll_offset_for_rows_above(
+            max_line,
+            viewport.saturating_sub(annotation_row_height(self, max_line)),
+        );
         self.update_current_file_from_cursor();
     }
 
     pub fn next_file(&mut self) {
+        if self.diff_state.cursor_line < self.review_comments_render_height() {
+            if !self.diff_files.is_empty() {
+                self.jump_to_file(0);
+            }
+            return;
+        }
         let visible_items = self.build_visible_items();
         let current_file_idx = self.diff_state.current_file_idx;
 
@@ -674,44 +879,13 @@ impl App {
     /// reviewed-collapse behavior in multi-file view (skipped entirely)
     /// versus single-file view (body rendered under a banner).
     pub(in crate::app) fn hunk_positions(&self) -> Vec<usize> {
-        let single = self.is_single_file_view;
-        let current_idx = self.diff_state.current_file_idx;
-        let mut positions = Vec::new();
-        let mut cumulative = self.review_comments_render_height();
-        for (file_idx, file) in self.diff_files.iter().enumerate() {
-            if single && file_idx != current_idx {
-                continue;
-            }
-            let path = file.display_path();
-            let is_reviewed = self.session.is_file_reviewed(path);
-
-            if !single {
-                cumulative += 1; // File header
-            }
-            if !single && is_reviewed {
-                // multi-file collapsed: no body, no trailing spacing
-                continue;
-            }
-            if single && is_reviewed {
-                cumulative += 1; // banner
-            }
-            if let Some(review) = self.session.files.get(path) {
-                cumulative += review.file_comments.len();
-            }
-            if file.is_binary || file.hunks.is_empty() {
-                cumulative += 1;
-            } else {
-                for (hunk_idx, hunk) in file.hunks.iter().enumerate() {
-                    positions.push(cumulative);
-                    cumulative += 1;
-                    if !self.is_hunk_reviewed(file_idx, hunk_idx) {
-                        cumulative += hunk.lines.len();
-                    }
-                }
-            }
-            cumulative += 1; // trailing spacing or "next file" hint
-        }
-        positions
+        self.line_annotations
+            .iter()
+            .enumerate()
+            .filter_map(|(row, line)| {
+                matches!(line, AnnotatedLine::HunkHeader { .. }).then_some(row)
+            })
+            .collect()
     }
 
     pub fn next_hunk(&mut self) {
@@ -733,8 +907,11 @@ impl App {
         // into the next file's first hunk so `]` can step the codebase
         // hunk-by-hunk without breaking on file boundaries.
         if self.is_single_file_view {
-            let next_idx = self.diff_state.current_file_idx + 1;
-            if next_idx < self.diff_files.len() {
+            // Step over files hidden by a file-tree filter: they render
+            // nothing, so landing on one would show an empty pane.
+            let next_idx = ((self.diff_state.current_file_idx + 1)..self.diff_files.len())
+                .find(|&idx| self.file_idx_passes_filter(idx));
+            if let Some(next_idx) = next_idx {
                 self.jump_to_file(next_idx);
                 if let Some(&first) = self.hunk_positions().first() {
                     self.diff_state.cursor_line = first;
@@ -762,8 +939,11 @@ impl App {
         // Symmetric to next_hunk: in single-file view, fall through to the
         // previous file's last hunk so `[` keeps stepping backward across
         // files.
-        if self.is_single_file_view && self.diff_state.current_file_idx > 0 {
-            let prev_idx = self.diff_state.current_file_idx - 1;
+        if self.is_single_file_view
+            && let Some(prev_idx) = (0..self.diff_state.current_file_idx)
+                .rev()
+                .find(|&idx| self.file_idx_passes_filter(idx))
+        {
             self.jump_to_file(prev_idx);
             if let Some(&last) = self.hunk_positions().last() {
                 self.diff_state.cursor_line = last;
@@ -788,10 +968,15 @@ impl App {
         offset
     }
 
-    pub(in crate::app) fn review_comments_render_height(&self) -> usize {
-        // Header line is only rendered in multi-file view. See the guards
-        // in `src/ui/diff_unified.rs` and `src/ui/diff_side_by_side.rs`.
-        let mut height = if self.is_single_file_view { 0 } else { 1 };
+    pub(in crate::app) fn review_comments_section_height(&self) -> usize {
+        // The header line must follow the render gate exactly (multi-file
+        // view + non-empty section). See the guards in
+        // `src/ui/diff_unified.rs` and `src/ui/diff_side_by_side.rs`.
+        let mut height = if self.show_review_comments_header() {
+            1
+        } else {
+            0
+        };
         for summary in &self.forge_review_summaries {
             height += crate::forge::remote_comments::summary_display_lines(summary);
         }
@@ -825,8 +1010,23 @@ impl App {
         height
     }
 
+    pub(in crate::app) fn review_comments_render_height(&self) -> usize {
+        self.issue_comments_start_line()
+            + crate::ui::pr_info_panel::issue_comments_render_height(self)
+    }
+
+    pub(crate) fn issue_comments_start_line(&self) -> usize {
+        crate::ui::pr_info_panel::pr_info_render_height(self)
+            + self.review_comments_section_height()
+    }
+
     pub(in crate::app) fn file_render_height(&self, file_idx: usize, file: &DiffFile) -> usize {
-        if self.session.is_file_reviewed(file.display_path()) {
+        // Filtered out: renders nothing, so it must occupy no render lines or
+        // every cumulative offset below it would drift.
+        if !self.file_passes_filter(file) {
+            return 0;
+        }
+        if self.should_collapse_file(file_idx) {
             return 1; // collapsed: header only
         }
         1 + self.file_render_body_height(file_idx, file) // header + body
@@ -914,7 +1114,7 @@ impl App {
 
                 // Hunk header + diff lines
                 content_lines += 1; // Hunk header
-                if self.is_hunk_reviewed(file_idx, hunk_idx) {
+                if self.should_collapse_hunk(file_idx, hunk_idx) {
                     continue;
                 }
 
@@ -1176,6 +1376,9 @@ impl App {
         if file_idx != self.diff_state.current_file_idx {
             return 0;
         }
+        if !self.file_passes_filter(file) {
+            return 0;
+        }
         let banner = if self.session.is_file_reviewed(file.display_path()) {
             1
         } else {
@@ -1284,13 +1487,39 @@ impl App {
                 old_lineno,
                 new_lineno,
                 ..
-            }) => {
-                // Prefer new line number (for added/context lines), fall back to old (for deleted)
-                new_lineno
-                    .map(|ln| (ln, LineSide::New))
-                    .or_else(|| old_lineno.map(|ln| (ln, LineSide::Old)))
-            }
+            }) => Self::line_for_side(self.effective_cursor_side(), *old_lineno, *new_lineno),
             _ => None,
+        }
+    }
+
+    /// The side the cursor effectively targets at its current line. In
+    /// side-by-side view it follows `cursor_side`; in unified view there is one
+    /// column, so `New` is preferred (falling back per line below). This is a
+    /// *preference*; [`line_for_side`] clamps it to the sides the line offers.
+    pub fn effective_cursor_side(&self) -> LineSide {
+        if self.diff_view_mode == DiffViewMode::SideBySide {
+            self.cursor_side
+        } else {
+            LineSide::New
+        }
+    }
+
+    /// Resolve a `(lineno, side)` for a diff line given a preferred side,
+    /// clamping to whichever side the line actually has. A pure addition has
+    /// only `new_lineno`; a pure deletion only `old_lineno`; a context line has
+    /// both, so the preference wins.
+    fn line_for_side(
+        prefer: LineSide,
+        old_lineno: Option<u32>,
+        new_lineno: Option<u32>,
+    ) -> Option<(u32, LineSide)> {
+        match prefer {
+            LineSide::Old => old_lineno
+                .map(|ln| (ln, LineSide::Old))
+                .or_else(|| new_lineno.map(|ln| (ln, LineSide::New))),
+            LineSide::New => new_lineno
+                .map(|ln| (ln, LineSide::New))
+                .or_else(|| old_lineno.map(|ln| (ln, LineSide::Old))),
         }
     }
 }

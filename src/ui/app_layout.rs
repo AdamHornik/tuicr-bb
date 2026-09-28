@@ -10,7 +10,9 @@ use crate::ui::diff_view::render_diff_view;
 use crate::ui::file_list::render_file_list;
 use crate::ui::inline_commit_selector::render_inline_commit_selector;
 use crate::ui::selector::render_commit_select;
-use crate::ui::{comment_panel, help_popup, status_bar, styles, submit_modals};
+use crate::ui::{
+    comment_panel, help_popup, status_bar, styles, submit_modals, summary_popup, theme_picker,
+};
 
 const FILE_LIST_MIN_HEIGHT: u16 = 4;
 const COMMENT_NAVIGATOR_MIN_HEIGHT: u16 = 4;
@@ -22,9 +24,33 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         frame.area(),
     );
 
-    // Special handling for commit selection mode
-    if app.input_mode == InputMode::CommitSelect {
+    if app.input_mode == InputMode::MessageDetails {
+        help_popup::render_message_details(frame, app);
+        return;
+    }
+
+    let selector_background = app.input_mode == InputMode::CommitSelect
+        || (app.input_mode == InputMode::Command
+            && app.command_return_mode == InputMode::CommitSelect)
+        || (app.input_mode == InputMode::Help
+            && app.overlay_return_mode == InputMode::CommitSelect)
+        || (app.searching_help() && app.overlay_return_mode == InputMode::CommitSelect);
+    if selector_background {
         render_commit_select(frame, app);
+        let area = frame.area();
+        let footer = Rect::new(
+            area.x,
+            area.bottom().saturating_sub(1),
+            area.width,
+            area.height.min(1),
+        );
+        if matches!(app.input_mode, InputMode::Command | InputMode::Search) {
+            status_bar::render_status_bar(frame, app, footer);
+            status_bar::render_command_completion_popup(frame, app, footer);
+        }
+        if app.input_mode == InputMode::Help || app.searching_help() {
+            help_popup::render_help(frame, app);
+        }
         return;
     }
 
@@ -67,6 +93,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     if app.input_mode == InputMode::SubmitActionPicker {
         submit_modals::render_submit_action_picker(frame, app);
     }
+    if app.input_mode == InputMode::ThemePicker {
+        theme_picker::render_theme_picker(frame, app);
+    }
 
     // Position terminal cursor for IME when in Comment mode
     // Always set a cursor position to prevent IME from showing at (0,0)
@@ -87,7 +116,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 }
 
 fn render_main_content(frame: &mut Frame, app: &mut App, area: Rect) {
-    let content_area = if app.has_inline_commit_selector() {
+    let content_area = if app.input_mode != InputMode::Summary && app.has_inline_commit_selector() {
         let selector_height = (app.review_commits.len() as u16 + 2).min(8); // N items + 2 borders, capped
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -137,15 +166,20 @@ fn render_main_content(frame: &mut Frame, app: &mut App, area: Rect) {
             app.comment_navigator_inner_area = None;
             render_file_list(frame, app, chunks[0]);
         }
-        app.diff_area = Some(chunks[1]);
-
-        render_diff_view(frame, app, chunks[1]);
+        render_content_view(frame, app, chunks[1]);
     } else {
         app.file_list_area = None;
         app.comment_navigator_area = None;
         app.comment_navigator_inner_area = None;
-        app.diff_area = Some(content_area);
+        render_content_view(frame, app, content_area);
+    }
+}
 
-        render_diff_view(frame, app, content_area);
+fn render_content_view(frame: &mut Frame, app: &mut App, area: Rect) {
+    app.diff_area = Some(area);
+    if app.input_mode == InputMode::Summary {
+        summary_popup::render_summary(frame, app, area);
+    } else {
+        render_diff_view(frame, app, area);
     }
 }

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -5,6 +6,53 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use toml::Value;
+
+/// Parsed `ignore_whitespace` setting.
+///
+/// Booleans keep the legacy global modes. `"auto"` selects per-extension
+/// comparison using the built-in table plus `[ignore_whitespace_overrides]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum IgnoreWhitespaceConfig {
+    Bool(bool),
+    Auto,
+}
+
+impl<'de> Deserialize<'de> for IgnoreWhitespaceConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct IgnoreWhitespaceVisitor;
+
+        impl serde::de::Visitor<'_> for IgnoreWhitespaceVisitor {
+            type Value = IgnoreWhitespaceConfig;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a boolean or \"auto\"")
+            }
+
+            fn visit_bool<E>(self, value: bool) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(IgnoreWhitespaceConfig::Bool(value))
+            }
+
+            fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if value == "auto" {
+                    Ok(IgnoreWhitespaceConfig::Auto)
+                } else {
+                    Err(E::invalid_value(serde::de::Unexpected::Str(value), &self))
+                }
+            }
+        }
+
+        deserializer.deserialize_any(IgnoreWhitespaceVisitor)
+    }
+}
 
 pub const DEFAULT_LEADER_KEY: char = ';';
 
@@ -34,6 +82,72 @@ impl Default for ForgeConfig {
     }
 }
 
+const DEFAULT_EXPORT_INTRO: &str =
+    "I reviewed your code and have the following comments. Please address them.";
+const DEFAULT_EXPORT_COMMENTS_HEADER: &str = "## Local tuicr Comments";
+const DEFAULT_EXPORT_REMOTE_COMMENTS_HEADER: &str = "## Existing GitHub Comments";
+
+/// `[export]` section settings shaping the generated review markdown.
+///
+/// Every field is optional so "unset" stays distinguishable from "set to the
+/// default". That distinction is load-bearing for `legend`, which the older
+/// top-level `export_legend` key also feeds: `[export]` may only override it
+/// when the section actually names the key.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ExportConfig {
+    /// Intro line above the comment list. An empty string omits it.
+    pub intro: Option<String>,
+    /// Whether to emit the `Reviewing <scope>` line.
+    pub scope_line: Option<bool>,
+    /// Whether to emit the `URL:`/`Head:` lines in pull request mode. Kept
+    /// separate from `scope_line` because they carry addressable metadata
+    /// rather than framing, so trimming the preamble need not drop them.
+    pub pr_metadata: Option<bool>,
+    /// Heading above locally authored comments. An empty string omits it.
+    pub comments_header: Option<String>,
+    /// Heading above unresolved remote threads. An empty string omits it.
+    pub remote_comments_header: Option<String>,
+    /// Whether to emit the `Comment types:` legend.
+    pub legend: Option<bool>,
+    /// Whether to emit the `## Session: <slug>` header.
+    pub session_header: Option<bool>,
+}
+
+impl ExportConfig {
+    pub fn intro(&self) -> &str {
+        self.intro.as_deref().unwrap_or(DEFAULT_EXPORT_INTRO)
+    }
+
+    pub fn scope_line(&self) -> bool {
+        self.scope_line.unwrap_or(true)
+    }
+
+    pub fn pr_metadata(&self) -> bool {
+        self.pr_metadata.unwrap_or(true)
+    }
+
+    pub fn comments_header(&self) -> &str {
+        self.comments_header
+            .as_deref()
+            .unwrap_or(DEFAULT_EXPORT_COMMENTS_HEADER)
+    }
+
+    pub fn remote_comments_header(&self) -> &str {
+        self.remote_comments_header
+            .as_deref()
+            .unwrap_or(DEFAULT_EXPORT_REMOTE_COMMENTS_HEADER)
+    }
+
+    pub fn legend(&self) -> bool {
+        self.legend.unwrap_or(true)
+    }
+
+    pub fn session_header(&self) -> bool {
+        self.session_header.unwrap_or(true)
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct AppConfig {
@@ -44,22 +158,61 @@ pub struct AppConfig {
     pub backend: Option<String>,
     pub comment_types: Option<Vec<CommentTypeConfig>>,
     pub show_file_list: Option<bool>,
+    /// Join single-child directory chains in the file tree. Defaults to false.
+    pub compact_folders: Option<bool>,
+    /// Whether pull-request CI checks are fetched and shown.
+    /// Defaults to false.
+    pub show_pr_checks: Option<bool>,
+    /// Whether pull-request conversation comments are fetched and shown.
+    /// Defaults to true.
+    pub show_pr_comments: Option<bool>,
+    /// Default visibility for PR review comment threads:
+    /// `"unresolved"` (the default), `"all"` or `"hide"`.
+    pub pr_comments_visibility: Option<String>,
+    /// Whether the inline commit selector pane is visible on startup for
+    /// multi-commit reviews. Defaults to true; toggle at runtime with
+    /// `<leader>s` or `:set commits!`.
+    pub show_commits: Option<bool>,
+    /// Whether files already marked reviewed appear in the file tree and the
+    /// diff. Defaults to true; toggle at runtime with `H` (file tree) or
+    /// `:set reviewed!`.
+    pub show_reviewed: Option<bool>,
     pub diff_view: Option<String>,
-    pub ignore_whitespace: Option<bool>,
+    /// Inline commit selector display order: `"descending"` (newest-first,
+    /// the default) or `"ascending"` (oldest-first).
+    pub commit_order: Option<String>,
+    /// Which commits are selected when a multi-commit review first opens:
+    /// `"all"` (the default) or `"oldest"` (only the oldest commit, for a
+    /// walk-forward per-commit review).
+    pub initial_commit_selection: Option<String>,
+    pub ignore_whitespace: Option<IgnoreWhitespaceConfig>,
+    /// Extension → ignore-whitespace decisions used only when
+    /// `ignore_whitespace = "auto"`. Keys are stored already normalized
+    /// (ASCII lowercase, no leading dot).
+    pub ignore_whitespace_overrides: BTreeMap<String, bool>,
     pub wrap: Option<bool>,
+    pub relative_line_numbers: Option<bool>,
     pub export_legend: Option<bool>,
     pub cursor_line: Option<bool>,
+    pub search_highlight: Option<bool>,
     pub mouse: Option<bool>,
     /// Enable vim-style modal editing in the review comment text box. When
     /// unset/false the comment box uses the default emacs/readline bindings.
     pub comment_vim: Option<bool>,
+    /// Restore the legacy bare `q` quit binding in review modes.
+    /// Defaults to false.
+    pub q_quits: Option<bool>,
     /// Number of spaces inserted by Tab while typing in the vim comment box.
     /// Defaults to 4 (matching diff tab expansion).
     pub comment_tab_width: Option<usize>,
     pub leader: Option<char>,
+    pub editor: Option<String>,
     pub transparent_background: Option<bool>,
     pub scroll_offset: Option<usize>,
     pub review_watch_interval_ms: Option<usize>,
+    /// Disabled by default, and `0` disables it too. Ignored for
+    /// pull-request reviews and `--all-files` mode.
+    pub diff_watch_interval_ms: Option<usize>,
     pub no_update_check: Option<bool>,
     /// Render single-file and pristine views in full-width mode by default.
     /// Pristine `--all-files` mode already defaults to true regardless of
@@ -72,6 +225,25 @@ pub struct AppConfig {
     /// `[forge]` section settings. Always present; `None` means "no override"
     /// and downstream code should treat it as `ForgeConfig::default()`.
     pub forge: Option<ForgeConfig>,
+    /// `[export]` section settings. `None` means "no override"; downstream
+    /// code should treat it as `ExportConfig::default()`.
+    pub export: Option<ExportConfig>,
+}
+
+impl AppConfig {
+    /// Effective export settings, layering `[export]` over the older
+    /// top-level `export_legend`.
+    ///
+    /// `[export]` wins only for keys it actually names, so a section that
+    /// sets just `intro` leaves a configured `export_legend` in force
+    /// instead of resetting the legend to its default.
+    pub fn resolved_export(&self) -> ExportConfig {
+        let mut export = self.export.clone().unwrap_or_default();
+        if export.legend.is_none() {
+            export.legend = self.export_legend;
+        }
+        export
+    }
 }
 
 /// Known top-level config keys. Used to warn about typos.
@@ -83,25 +255,50 @@ const KNOWN_KEYS: &[&str] = &[
     "backend",
     "comment_types",
     "show_file_list",
+    "compact_folders",
+    "show_pr_checks",
+    "show_pr_comments",
+    "pr_comments_visibility",
+    "show_commits",
+    "show_reviewed",
     "diff_view",
+    "commit_order",
+    "initial_commit_selection",
     "ignore_whitespace",
+    "ignore_whitespace_overrides",
     "wrap",
+    "relative_line_numbers",
     "export_legend",
     "cursor_line",
+    "search_highlight",
     "mouse",
     "comment_vim",
+    "q_quits",
     "comment_tab_width",
     "leader",
+    "editor",
     "transparent_background",
     "scroll_offset",
     "review_watch_interval_ms",
+    "diff_watch_interval_ms",
     "no_update_check",
     "single_file_view",
     "username",
     "forge",
+    "export",
 ];
 
 const FORGE_KNOWN_KEYS: &[&str] = &["comment_type_prefix"];
+
+const EXPORT_KNOWN_KEYS: &[&str] = &[
+    "intro",
+    "scope_line",
+    "pr_metadata",
+    "comments_header",
+    "remote_comments_header",
+    "legend",
+    "session_header",
+];
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ConfigLoadOutcome {
@@ -149,8 +346,8 @@ fn themes_dir_from_parts(
 }
 
 fn config_dir_from_parts(
-    xdg_config_home: Option<PathBuf>,
-    home: Option<PathBuf>,
+    _xdg_config_home: Option<PathBuf>,
+    _home: Option<PathBuf>,
     _appdata: Option<PathBuf>,
 ) -> Result<PathBuf> {
     #[cfg(windows)]
@@ -163,11 +360,11 @@ fn config_dir_from_parts(
 
     #[cfg(not(windows))]
     {
-        if let Some(base) = xdg_config_home.filter(|p| !p.as_os_str().is_empty()) {
+        if let Some(base) = _xdg_config_home.filter(|p| !p.as_os_str().is_empty()) {
             return Ok(base.join("tuicr"));
         }
 
-        let home = home
+        let home = _home
             .filter(|p| !p.as_os_str().is_empty())
             .ok_or_else(|| anyhow!("Could not determine HOME for config directory"))?;
         Ok(home.join(".config").join("tuicr"))
@@ -265,6 +462,92 @@ fn read_enum(
     }
 }
 
+fn read_ignore_whitespace(
+    table: &toml::Table,
+    warnings: &mut Vec<String>,
+) -> Option<IgnoreWhitespaceConfig> {
+    let val = table.get("ignore_whitespace")?;
+    if let Some(b) = val.as_bool() {
+        return Some(IgnoreWhitespaceConfig::Bool(b));
+    }
+    if let Some(s) = val.as_str() {
+        if s == "auto" {
+            return Some(IgnoreWhitespaceConfig::Auto);
+        }
+        warnings.push(format!(
+            "Warning: Config key 'ignore_whitespace' must be true, false, or \"auto\"; got \"{s}\", ignoring"
+        ));
+        return None;
+    }
+    warnings.push(
+        "Warning: Config key 'ignore_whitespace' must be a boolean or \"auto\"; ignoring value"
+            .to_string(),
+    );
+    None
+}
+
+fn parse_ignore_whitespace_overrides(
+    table: &toml::Table,
+    warnings: &mut Vec<String>,
+) -> Option<BTreeMap<String, bool>> {
+    let val = table.get("ignore_whitespace_overrides")?;
+    let Some(overrides) = val.as_table() else {
+        warnings.push(
+            "Warning: Config key 'ignore_whitespace_overrides' must be a table; ignoring value"
+                .to_string(),
+        );
+        return None;
+    };
+
+    let mut parsed = BTreeMap::new();
+    for (raw_key, value) in overrides {
+        let Some(normalized) = normalize_override_extension(raw_key, warnings) else {
+            continue;
+        };
+        let Some(ignore) = value.as_bool() else {
+            warnings.push(format!(
+                "Warning: Config key 'ignore_whitespace_overrides.{raw_key}' must be a boolean; ignoring value"
+            ));
+            continue;
+        };
+        if parsed.contains_key(&normalized) {
+            warnings.push(format!(
+                "Warning: Config key 'ignore_whitespace_overrides.{raw_key}' collides with already-defined extension '{normalized}'; ignoring value"
+            ));
+            continue;
+        }
+        parsed.insert(normalized, ignore);
+    }
+    Some(parsed)
+}
+
+fn normalize_override_extension(raw_key: &str, warnings: &mut Vec<String>) -> Option<String> {
+    let key = raw_key.trim();
+    let invalid_reason = if key.is_empty() {
+        Some("must be a non-empty extension")
+    } else if key.starts_with('.') {
+        Some("must not start with a dot")
+    } else if key.contains('.')
+        || key.contains('/')
+        || key.contains('\\')
+        || key.contains('*')
+        || key.contains('?')
+        || key.contains('[')
+        || key.contains(']')
+    {
+        Some("must be a single extension without a path or glob")
+    } else {
+        None
+    };
+    if let Some(reason) = invalid_reason {
+        warnings.push(format!(
+            "Warning: Config key 'ignore_whitespace_overrides.{raw_key}' {reason}; ignoring value"
+        ));
+        return None;
+    }
+    Some(key.to_ascii_lowercase())
+}
+
 fn load_config_from_path(path: &Path) -> Result<ConfigLoadOutcome> {
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
@@ -279,6 +562,18 @@ fn load_config_from_path(path: &Path) -> Result<ConfigLoadOutcome> {
 
     let mut warnings = Vec::new();
 
+    let ignore_whitespace = read_ignore_whitespace(table, &mut warnings);
+    let parsed_overrides = parse_ignore_whitespace_overrides(table, &mut warnings);
+    if parsed_overrides.is_some()
+        && !matches!(ignore_whitespace, Some(IgnoreWhitespaceConfig::Auto))
+    {
+        warnings.push(
+            "Warning: Config key 'ignore_whitespace_overrides' is only used when ignore_whitespace = \"auto\"; ignoring table"
+                .to_string(),
+        );
+    }
+    let ignore_whitespace_overrides = parsed_overrides.unwrap_or_default();
+
     let config = AppConfig {
         theme: read_string(table, "theme", &mut warnings),
         theme_dark: read_string(table, "theme_dark", &mut warnings),
@@ -289,29 +584,61 @@ fn load_config_from_path(path: &Path) -> Result<ConfigLoadOutcome> {
             .get("comment_types")
             .and_then(|v| parse_comment_types(v, &mut warnings)),
         show_file_list: read_bool(table, "show_file_list", &mut warnings),
+        compact_folders: read_bool(table, "compact_folders", &mut warnings),
+        show_pr_checks: read_bool(table, "show_pr_checks", &mut warnings),
+        show_pr_comments: read_bool(table, "show_pr_comments", &mut warnings),
+        pr_comments_visibility: read_enum(
+            table,
+            "pr_comments_visibility",
+            &["unresolved", "all", "hide"],
+            &mut warnings,
+        ),
+        show_commits: read_bool(table, "show_commits", &mut warnings),
+        show_reviewed: read_bool(table, "show_reviewed", &mut warnings),
         diff_view: read_enum(
             table,
             "diff_view",
             &["unified", "side-by-side"],
             &mut warnings,
         ),
-        ignore_whitespace: read_bool(table, "ignore_whitespace", &mut warnings),
+        relative_line_numbers: read_bool(table, "relative_line_numbers", &mut warnings),
+        commit_order: read_enum(
+            table,
+            "commit_order",
+            &["descending", "ascending"],
+            &mut warnings,
+        ),
+        initial_commit_selection: read_enum(
+            table,
+            "initial_commit_selection",
+            &["all", "oldest"],
+            &mut warnings,
+        ),
+        ignore_whitespace,
+        ignore_whitespace_overrides,
         wrap: read_bool(table, "wrap", &mut warnings),
         export_legend: read_bool(table, "export_legend", &mut warnings),
         cursor_line: read_bool(table, "cursor_line", &mut warnings),
+        search_highlight: read_bool(table, "search_highlight", &mut warnings),
         mouse: read_bool(table, "mouse", &mut warnings),
         comment_vim: read_bool(table, "comment_vim", &mut warnings),
+        q_quits: read_bool(table, "q_quits", &mut warnings),
         comment_tab_width: read_usize(table, "comment_tab_width", &mut warnings),
         leader: read_leader(table, &mut warnings),
+        editor: read_string(table, "editor", &mut warnings),
         transparent_background: read_bool(table, "transparent_background", &mut warnings),
         scroll_offset: read_usize(table, "scroll_offset", &mut warnings),
         review_watch_interval_ms: read_usize(table, "review_watch_interval_ms", &mut warnings),
+        diff_watch_interval_ms: read_usize(table, "diff_watch_interval_ms", &mut warnings),
         no_update_check: read_bool(table, "no_update_check", &mut warnings),
         single_file_view: read_bool(table, "single_file_view", &mut warnings),
         username: read_string(table, "username", &mut warnings),
         forge: table
             .get("forge")
             .and_then(|v| parse_forge(v, &mut warnings)),
+        export: table
+            .get("export")
+            .and_then(|v| parse_export(v, &mut warnings)),
     };
 
     for key in table.keys() {
@@ -347,7 +674,7 @@ fn parse_forge(value: &Value, warnings: &mut Vec<String>) -> Option<ForgeConfig>
     let mut cfg = defaults.clone();
     let mut any_override = false;
 
-    if let Some(v) = read_forge_bool(table, "comment_type_prefix", warnings) {
+    if let Some(v) = read_section_bool(table, "forge", "comment_type_prefix", warnings) {
         cfg.comment_type_prefix = v;
         any_override = true;
     }
@@ -355,15 +682,77 @@ fn parse_forge(value: &Value, warnings: &mut Vec<String>) -> Option<ForgeConfig>
     if any_override { Some(cfg) } else { None }
 }
 
-/// Like `read_bool`, but emits a `forge.<key>` qualified warning so the user
-/// can locate the misconfigured field.
-fn read_forge_bool(table: &toml::Table, key: &str, warnings: &mut Vec<String>) -> Option<bool> {
+/// Parse the `[export]` section. Returns `Some` only when at least one
+/// recognized key is set, so an absent or empty section leaves every default —
+/// and the older top-level `export_legend` — untouched.
+fn parse_export(value: &Value, warnings: &mut Vec<String>) -> Option<ExportConfig> {
+    let Some(table) = value.as_table() else {
+        warnings.push("Warning: Config key 'export' must be a table; ignoring value".to_string());
+        return None;
+    };
+
+    for key in table.keys() {
+        if !EXPORT_KNOWN_KEYS.contains(&key.as_str()) {
+            warnings.push(format!(
+                "Warning: Unknown config key 'export.{key}', ignoring"
+            ));
+        }
+    }
+
+    let cfg = ExportConfig {
+        intro: read_section_string(table, "export", "intro", warnings),
+        scope_line: read_section_bool(table, "export", "scope_line", warnings),
+        pr_metadata: read_section_bool(table, "export", "pr_metadata", warnings),
+        comments_header: read_section_string(table, "export", "comments_header", warnings),
+        remote_comments_header: read_section_string(
+            table,
+            "export",
+            "remote_comments_header",
+            warnings,
+        ),
+        legend: read_section_bool(table, "export", "legend", warnings),
+        session_header: read_section_bool(table, "export", "session_header", warnings),
+    };
+
+    if cfg == ExportConfig::default() {
+        None
+    } else {
+        Some(cfg)
+    }
+}
+
+/// Like `read_bool`, but emits a `<section>.<key>` qualified warning so the
+/// user can locate the misconfigured field.
+fn read_section_bool(
+    table: &toml::Table,
+    section: &str,
+    key: &str,
+    warnings: &mut Vec<String>,
+) -> Option<bool> {
     let val = table.get(key)?;
     if let Some(b) = val.as_bool() {
         Some(b)
     } else {
         warnings.push(format!(
-            "Warning: Config key 'forge.{key}' must be a boolean; ignoring value"
+            "Warning: Config key '{section}.{key}' must be a boolean; ignoring value"
+        ));
+        None
+    }
+}
+
+/// Like `read_string`, but emits a `<section>.<key>` qualified warning.
+fn read_section_string(
+    table: &toml::Table,
+    section: &str,
+    key: &str,
+    warnings: &mut Vec<String>,
+) -> Option<String> {
+    let val = table.get(key)?;
+    if let Some(s) = val.as_str() {
+        Some(s.to_string())
+    } else {
+        warnings.push(format!(
+            "Warning: Config key '{section}.{key}' must be a string; ignoring value"
         ));
         None
     }
@@ -692,6 +1081,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn should_parse_compact_folders_and_reject_invalid_types() {
+        for value in [true, false] {
+            let outcome = parse_config(&format!("compact_folders = {value}\n"));
+            assert_eq!(outcome.config.unwrap().compact_folders, Some(value));
+            assert!(outcome.warnings.is_empty());
+        }
+        let outcome = parse_config("compact_folders = \"yes\"\n");
+        assert_eq!(outcome.config.unwrap().compact_folders, None);
+        assert_eq!(outcome.warnings.len(), 1);
+    }
+
     // show_file_list
 
     #[test]
@@ -712,6 +1113,113 @@ mod tests {
             None
         );
         assert_eq!(outcome.warnings.len(), 1);
+    }
+
+    // show_pr_checks
+
+    #[test]
+    fn should_parse_show_pr_checks_false() {
+        let outcome = parse_config("show_pr_checks = false\n");
+        assert_eq!(
+            outcome.config.as_ref().and_then(|cfg| cfg.show_pr_checks),
+            Some(false)
+        );
+        assert!(outcome.warnings.is_empty());
+    }
+
+    #[test]
+    fn should_warn_and_ignore_show_pr_checks_with_invalid_type() {
+        let outcome = parse_config("show_pr_checks = \"no\"\n");
+        assert_eq!(
+            outcome.config.as_ref().and_then(|cfg| cfg.show_pr_checks),
+            None
+        );
+        assert_eq!(
+            outcome.warnings,
+            vec!["Warning: Config key 'show_pr_checks' must be a boolean; ignoring value"]
+        );
+    }
+
+    // show_pr_comments
+
+    #[test]
+    fn should_parse_show_pr_comments_false() {
+        let outcome = parse_config("show_pr_comments = false\n");
+        assert_eq!(
+            outcome.config.as_ref().and_then(|cfg| cfg.show_pr_comments),
+            Some(false)
+        );
+        assert!(outcome.warnings.is_empty());
+    }
+
+    #[test]
+    fn should_warn_and_ignore_show_pr_comments_with_invalid_type() {
+        let outcome = parse_config("show_pr_comments = \"no\"\n");
+        assert_eq!(
+            outcome.config.as_ref().and_then(|cfg| cfg.show_pr_comments),
+            None
+        );
+        assert_eq!(
+            outcome.warnings,
+            vec!["Warning: Config key 'show_pr_comments' must be a boolean; ignoring value"]
+        );
+    }
+
+    // show_commits
+
+    #[test]
+    fn should_parse_show_commits_false() {
+        let outcome = parse_config("show_commits = false\n");
+        assert_eq!(
+            outcome.config.as_ref().and_then(|cfg| cfg.show_commits),
+            Some(false)
+        );
+        assert!(outcome.warnings.is_empty());
+    }
+
+    #[test]
+    fn should_warn_and_ignore_show_commits_with_invalid_type() {
+        let outcome = parse_config("show_commits = \"no\"\n");
+        assert_eq!(
+            outcome.config.as_ref().and_then(|cfg| cfg.show_commits),
+            None
+        );
+        assert_eq!(outcome.warnings.len(), 1);
+    }
+
+    // show_reviewed
+
+    #[test]
+    fn should_parse_show_reviewed_false() {
+        let outcome = parse_config("show_reviewed = false\n");
+        assert_eq!(
+            outcome.config.as_ref().and_then(|cfg| cfg.show_reviewed),
+            Some(false)
+        );
+        assert!(outcome.warnings.is_empty());
+    }
+
+    #[test]
+    fn should_warn_and_ignore_show_reviewed_with_invalid_type() {
+        let outcome = parse_config("show_reviewed = \"no\"\n");
+        assert_eq!(
+            outcome.config.as_ref().and_then(|cfg| cfg.show_reviewed),
+            None
+        );
+        assert_eq!(outcome.warnings.len(), 1);
+    }
+
+    #[test]
+    fn should_parse_relative_line_numbers() {
+        let outcome = parse_config("relative_line_numbers = true\n");
+        assert_eq!(
+            outcome
+                .config
+                .as_ref()
+                .and_then(|cfg| cfg.relative_line_numbers),
+            Some(true)
+        );
+        assert!(outcome.warnings.is_empty());
     }
 
     // diff_view
@@ -740,6 +1248,62 @@ mod tests {
             Some("unified")
         );
         assert!(outcome.warnings.is_empty());
+    }
+
+    // commit_order / initial_commit_selection
+
+    #[test]
+    fn should_parse_commit_order_ascending() {
+        let outcome = parse_config("commit_order = \"ascending\"\n");
+        assert_eq!(
+            outcome
+                .config
+                .as_ref()
+                .and_then(|cfg| cfg.commit_order.as_deref()),
+            Some("ascending")
+        );
+        assert!(outcome.warnings.is_empty());
+    }
+
+    #[test]
+    fn should_warn_and_ignore_commit_order_with_invalid_value() {
+        let outcome = parse_config("commit_order = \"sideways\"\n");
+        assert_eq!(
+            outcome
+                .config
+                .as_ref()
+                .and_then(|cfg| cfg.commit_order.as_deref()),
+            None
+        );
+        assert_eq!(outcome.warnings.len(), 1);
+        assert!(outcome.warnings[0].contains("\"descending\" or \"ascending\""));
+    }
+
+    #[test]
+    fn should_parse_initial_commit_selection_oldest() {
+        let outcome = parse_config("initial_commit_selection = \"oldest\"\n");
+        assert_eq!(
+            outcome
+                .config
+                .as_ref()
+                .and_then(|cfg| cfg.initial_commit_selection.as_deref()),
+            Some("oldest")
+        );
+        assert!(outcome.warnings.is_empty());
+    }
+
+    #[test]
+    fn should_warn_and_ignore_initial_commit_selection_with_invalid_value() {
+        let outcome = parse_config("initial_commit_selection = \"newest\"\n");
+        assert_eq!(
+            outcome
+                .config
+                .as_ref()
+                .and_then(|cfg| cfg.initial_commit_selection.as_deref()),
+            None
+        );
+        assert_eq!(outcome.warnings.len(), 1);
+        assert!(outcome.warnings[0].contains("\"all\" or \"oldest\""));
     }
 
     #[test]
@@ -773,6 +1337,54 @@ mod tests {
         );
     }
 
+    // pr_comments_visibility
+
+    #[test]
+    fn should_parse_pr_comments_visibility_values() {
+        for value in ["unresolved", "all", "hide"] {
+            let outcome = parse_config(&format!("pr_comments_visibility = \"{value}\"\n"));
+            assert_eq!(
+                outcome
+                    .config
+                    .as_ref()
+                    .and_then(|cfg| cfg.pr_comments_visibility.as_deref()),
+                Some(value)
+            );
+            assert!(outcome.warnings.is_empty(), "{value} should parse cleanly");
+        }
+    }
+
+    #[test]
+    fn should_warn_and_ignore_pr_comments_visibility_with_invalid_value() {
+        let outcome = parse_config("pr_comments_visibility = \"shown\"\n");
+        assert_eq!(
+            outcome
+                .config
+                .as_ref()
+                .and_then(|cfg| cfg.pr_comments_visibility.as_deref()),
+            None
+        );
+        assert_eq!(outcome.warnings.len(), 1);
+        assert!(outcome.warnings[0].contains("\"unresolved\" or \"all\" or \"hide\""));
+    }
+
+    #[test]
+    fn should_warn_and_ignore_pr_comments_visibility_with_invalid_type() {
+        let outcome = parse_config("pr_comments_visibility = true\n");
+        assert_eq!(
+            outcome
+                .config
+                .as_ref()
+                .and_then(|cfg| cfg.pr_comments_visibility.as_deref()),
+            None
+        );
+        assert_eq!(outcome.warnings.len(), 1);
+        assert_eq!(
+            outcome.warnings[0],
+            "Warning: Config key 'pr_comments_visibility' must be a string; ignoring value"
+        );
+    }
+
     // ignore_whitespace
 
     #[test]
@@ -782,8 +1394,8 @@ mod tests {
             outcome
                 .config
                 .as_ref()
-                .and_then(|cfg| cfg.ignore_whitespace),
-            Some(true)
+                .and_then(|cfg| cfg.ignore_whitespace.clone()),
+            Some(IgnoreWhitespaceConfig::Bool(true))
         );
         assert!(outcome.warnings.is_empty());
     }
@@ -795,26 +1407,186 @@ mod tests {
             outcome
                 .config
                 .as_ref()
-                .and_then(|cfg| cfg.ignore_whitespace),
-            Some(false)
+                .and_then(|cfg| cfg.ignore_whitespace.clone()),
+            Some(IgnoreWhitespaceConfig::Bool(false))
         );
         assert!(outcome.warnings.is_empty());
     }
 
     #[test]
-    fn should_warn_and_ignore_ignore_whitespace_with_invalid_type() {
-        let outcome = parse_config("ignore_whitespace = \"yes\"\n");
+    fn should_parse_ignore_whitespace_auto() {
+        let outcome = parse_config("ignore_whitespace = \"auto\"\n");
         assert_eq!(
             outcome
                 .config
                 .as_ref()
-                .and_then(|cfg| cfg.ignore_whitespace),
+                .and_then(|cfg| cfg.ignore_whitespace.clone()),
+            Some(IgnoreWhitespaceConfig::Auto)
+        );
+        assert!(
+            outcome
+                .config
+                .as_ref()
+                .map(|cfg| cfg.ignore_whitespace_overrides.is_empty())
+                .unwrap_or(false)
+        );
+        assert!(outcome.warnings.is_empty());
+    }
+
+    #[test]
+    fn should_parse_ignore_whitespace_auto_with_explicit_overrides() {
+        let outcome = parse_config(
+            "ignore_whitespace = \"auto\"\n\
+             [ignore_whitespace_overrides]\n\
+             rs = false\n\
+             custom = true\n",
+        );
+        let config = outcome.config.expect("config should parse");
+        assert_eq!(config.ignore_whitespace, Some(IgnoreWhitespaceConfig::Auto));
+        assert_eq!(config.ignore_whitespace_overrides.get("rs"), Some(&false));
+        assert_eq!(
+            config.ignore_whitespace_overrides.get("custom"),
+            Some(&true)
+        );
+        assert!(outcome.warnings.is_empty());
+    }
+
+    #[test]
+    fn should_parse_empty_ignore_whitespace_overrides_table() {
+        let outcome = parse_config(
+            "ignore_whitespace = \"auto\"\n\
+             [ignore_whitespace_overrides]\n",
+        );
+        let config = outcome.config.expect("config should parse");
+        assert_eq!(config.ignore_whitespace, Some(IgnoreWhitespaceConfig::Auto));
+        assert!(config.ignore_whitespace_overrides.is_empty());
+        assert!(outcome.warnings.is_empty());
+    }
+
+    #[test]
+    fn should_warn_when_ignore_whitespace_overrides_are_inactive() {
+        let outcome = parse_config(
+            "ignore_whitespace = true\n\
+             [ignore_whitespace_overrides]\n\
+             rs = false\n",
+        );
+        let config = outcome.config.expect("config should parse");
+        assert_eq!(
+            config.ignore_whitespace,
+            Some(IgnoreWhitespaceConfig::Bool(true))
+        );
+        assert_eq!(config.ignore_whitespace_overrides.get("rs"), Some(&false));
+        assert_eq!(outcome.warnings.len(), 1);
+        assert_eq!(
+            outcome.warnings[0],
+            "Warning: Config key 'ignore_whitespace_overrides' is only used when ignore_whitespace = \"auto\"; ignoring table"
+        );
+    }
+
+    #[test]
+    fn should_normalize_override_extension_case() {
+        let outcome = parse_config(
+            "ignore_whitespace = \"auto\"\n\
+             [ignore_whitespace_overrides]\n\
+             RS = false\n",
+        );
+        let config = outcome.config.expect("config should parse");
+        assert_eq!(config.ignore_whitespace_overrides.get("rs"), Some(&false));
+        assert!(outcome.warnings.is_empty());
+    }
+
+    #[test]
+    fn should_warn_and_ignore_malformed_override_keys() {
+        let outcome = parse_config(
+            "ignore_whitespace = \"auto\"\n\
+             [ignore_whitespace_overrides]\n\
+             \"\" = true\n\
+             \".rs\" = true\n\
+             \"src/foo\" = true\n\
+             \"*.json\" = true\n\
+             \"tar.gz\" = true\n\
+             custom = true\n",
+        );
+        let config = outcome.config.expect("config should parse");
+        assert_eq!(
+            config.ignore_whitespace_overrides.get("custom"),
+            Some(&true)
+        );
+        assert_eq!(config.ignore_whitespace_overrides.len(), 1);
+        assert_eq!(outcome.warnings.len(), 5);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .all(|warning| warning.contains("ignore_whitespace_overrides"))
+        );
+    }
+
+    #[test]
+    fn should_warn_and_ignore_normalized_override_collisions() {
+        let outcome = parse_config(
+            "ignore_whitespace = \"auto\"\n\
+             [ignore_whitespace_overrides]\n\
+             RS = true\n\
+             rs = false\n",
+        );
+        let config = outcome.config.expect("config should parse");
+        assert_eq!(config.ignore_whitespace_overrides.len(), 1);
+        assert!(config.ignore_whitespace_overrides.contains_key("rs"));
+        assert_eq!(outcome.warnings.len(), 1);
+        assert!(outcome.warnings[0].contains("collides with already-defined extension 'rs'"));
+    }
+
+    #[test]
+    fn should_warn_and_ignore_override_with_invalid_type() {
+        let outcome = parse_config(
+            "ignore_whitespace = \"auto\"\n\
+             [ignore_whitespace_overrides]\n\
+             rs = \"yes\"\n\
+             custom = 1\n",
+        );
+        let config = outcome.config.expect("config should parse");
+        assert!(config.ignore_whitespace_overrides.is_empty());
+        assert_eq!(outcome.warnings.len(), 2);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .all(|warning| warning.contains("must be a boolean"))
+        );
+    }
+
+    #[test]
+    fn should_warn_and_ignore_ignore_whitespace_with_invalid_type() {
+        let outcome = parse_config("ignore_whitespace = 1\n");
+        assert_eq!(
+            outcome
+                .config
+                .as_ref()
+                .and_then(|cfg| cfg.ignore_whitespace.clone()),
             None
         );
         assert_eq!(outcome.warnings.len(), 1);
         assert_eq!(
             outcome.warnings[0],
-            "Warning: Config key 'ignore_whitespace' must be a boolean; ignoring value"
+            "Warning: Config key 'ignore_whitespace' must be a boolean or \"auto\"; ignoring value"
+        );
+    }
+
+    #[test]
+    fn should_warn_and_ignore_ignore_whitespace_with_invalid_string() {
+        let outcome = parse_config("ignore_whitespace = \"yes\"\n");
+        assert_eq!(
+            outcome
+                .config
+                .as_ref()
+                .and_then(|cfg| cfg.ignore_whitespace.clone()),
+            None
+        );
+        assert_eq!(outcome.warnings.len(), 1);
+        assert_eq!(
+            outcome.warnings[0],
+            "Warning: Config key 'ignore_whitespace' must be true, false, or \"auto\"; got \"yes\", ignoring"
         );
     }
 
@@ -893,6 +1665,65 @@ mod tests {
         );
     }
 
+    // diff_watch_interval_ms
+
+    #[test]
+    fn should_parse_diff_watch_interval_ms() {
+        let outcome = parse_config("diff_watch_interval_ms = 250\n");
+        assert_eq!(
+            outcome
+                .config
+                .as_ref()
+                .and_then(|cfg| cfg.diff_watch_interval_ms),
+            Some(250)
+        );
+        assert!(outcome.warnings.is_empty());
+    }
+
+    /// Unlike `review_watch_interval_ms`, this feature must default to off:
+    /// an absent key must parse to `None`, not a positive interval.
+    #[test]
+    fn should_default_diff_watch_interval_ms_to_none_when_absent() {
+        let outcome = parse_config("theme = \"dark\"\n");
+        assert_eq!(
+            outcome
+                .config
+                .as_ref()
+                .and_then(|cfg| cfg.diff_watch_interval_ms),
+            None
+        );
+    }
+
+    #[test]
+    fn should_parse_zero_diff_watch_interval_ms_to_allow_disable() {
+        let outcome = parse_config("diff_watch_interval_ms = 0\n");
+        assert_eq!(
+            outcome
+                .config
+                .as_ref()
+                .and_then(|cfg| cfg.diff_watch_interval_ms),
+            Some(0)
+        );
+        assert!(outcome.warnings.is_empty());
+    }
+
+    #[test]
+    fn should_warn_and_ignore_negative_diff_watch_interval_ms() {
+        let outcome = parse_config("diff_watch_interval_ms = -1\n");
+        assert_eq!(
+            outcome
+                .config
+                .as_ref()
+                .and_then(|cfg| cfg.diff_watch_interval_ms),
+            None
+        );
+        assert_eq!(outcome.warnings.len(), 1);
+        assert_eq!(
+            outcome.warnings[0],
+            "Warning: Config key 'diff_watch_interval_ms' must be a non-negative integer; ignoring value"
+        );
+    }
+
     // mouse
 
     #[test]
@@ -919,6 +1750,35 @@ mod tests {
         assert_eq!(
             outcome.warnings[0],
             "Warning: Config key 'mouse' must be a boolean; ignoring value"
+        );
+    }
+
+    // q_quits
+
+    #[test]
+    fn should_parse_q_quits_true() {
+        let outcome = parse_config("q_quits = true\n");
+        assert_eq!(
+            outcome.config.as_ref().and_then(|cfg| cfg.q_quits),
+            Some(true)
+        );
+        assert!(outcome.warnings.is_empty());
+    }
+
+    #[test]
+    fn should_default_q_quits_to_none() {
+        let outcome = parse_config("\n");
+        assert_eq!(outcome.config.as_ref().and_then(|cfg| cfg.q_quits), None);
+    }
+
+    #[test]
+    fn should_warn_and_ignore_q_quits_with_invalid_type() {
+        let outcome = parse_config("q_quits = \"yes\"\n");
+        assert_eq!(outcome.config.as_ref().and_then(|cfg| cfg.q_quits), None);
+        assert_eq!(outcome.warnings.len(), 1);
+        assert_eq!(
+            outcome.warnings[0],
+            "Warning: Config key 'q_quits' must be a boolean; ignoring value"
         );
     }
 
@@ -953,6 +1813,32 @@ mod tests {
         assert_eq!(
             outcome.warnings[0],
             "Warning: Config key 'leader' must be a string; ignoring value"
+        );
+    }
+
+    // editor
+
+    #[test]
+    fn should_parse_editor_command_with_args() {
+        let outcome = parse_config("editor = \"code -w\"\n");
+        assert_eq!(
+            outcome.config.as_ref().and_then(|cfg| cfg.editor.clone()),
+            Some("code -w".to_string())
+        );
+        assert!(outcome.warnings.is_empty());
+    }
+
+    #[test]
+    fn should_warn_and_ignore_editor_with_invalid_type() {
+        let outcome = parse_config("editor = 42\n");
+        assert_eq!(
+            outcome.config.as_ref().and_then(|cfg| cfg.editor.clone()),
+            None
+        );
+        assert_eq!(outcome.warnings.len(), 1);
+        assert_eq!(
+            outcome.warnings[0],
+            "Warning: Config key 'editor' must be a string; ignoring value"
         );
     }
 
@@ -1218,6 +2104,221 @@ comment_type_prefix = "yes"
         assert_eq!(comment_types[0].id, "note");
         assert_eq!(comment_types[0].color, None);
         assert_eq!(outcome.warnings.len(), 1);
+    }
+
+    // export
+
+    #[test]
+    fn export_accessors_fall_back_to_shipped_defaults() {
+        // Locks the defaults to the strings tuicr has always emitted, so a
+        // config-layer change cannot silently alter existing exports.
+        let cfg = ExportConfig::default();
+        assert_eq!(
+            cfg.intro(),
+            "I reviewed your code and have the following comments. Please address them."
+        );
+        assert!(cfg.scope_line());
+        assert!(cfg.pr_metadata());
+        assert_eq!(cfg.comments_header(), "## Local tuicr Comments");
+        assert_eq!(cfg.remote_comments_header(), "## Existing GitHub Comments");
+        assert!(cfg.legend());
+    }
+
+    #[test]
+    fn should_default_export_to_none_when_section_missing() {
+        let outcome = parse_config("");
+        assert_eq!(
+            outcome.config.as_ref().and_then(|cfg| cfg.export.clone()),
+            None
+        );
+        assert!(outcome.warnings.is_empty());
+    }
+
+    #[test]
+    fn should_default_export_to_none_when_section_is_empty_table() {
+        let outcome = parse_config("[export]\n");
+        assert_eq!(
+            outcome.config.as_ref().and_then(|cfg| cfg.export.clone()),
+            None
+        );
+        assert!(outcome.warnings.is_empty());
+    }
+
+    #[test]
+    fn should_parse_export_section_overriding_defaults() {
+        // `r###` because the TOML contains `"##`, which would close `r#"…"#`.
+        let outcome = parse_config(
+            r###"[export]
+intro = "Code review comments:"
+scope_line = false
+pr_metadata = false
+comments_header = "## Comments"
+remote_comments_header = "## Upstream"
+legend = false
+session_header = false
+"###,
+        );
+        let export = outcome
+            .config
+            .as_ref()
+            .and_then(|cfg| cfg.export.clone())
+            .expect("export section should parse");
+        assert_eq!(export.intro(), "Code review comments:");
+        assert!(!export.scope_line());
+        assert!(!export.pr_metadata());
+        assert_eq!(export.comments_header(), "## Comments");
+        assert_eq!(export.remote_comments_header(), "## Upstream");
+        assert!(!export.legend());
+        assert!(!export.session_header());
+        assert!(outcome.warnings.is_empty());
+    }
+
+    #[test]
+    fn should_treat_empty_export_strings_as_explicit_overrides() {
+        // An empty string means "omit this line", which is distinct from the
+        // key being absent. The accessor must not fall back to the default.
+        let outcome = parse_config(
+            r#"[export]
+intro = ""
+comments_header = ""
+"#,
+        );
+        let export = outcome
+            .config
+            .as_ref()
+            .and_then(|cfg| cfg.export.clone())
+            .expect("export section should parse");
+        assert_eq!(export.intro(), "");
+        assert_eq!(export.comments_header(), "");
+        assert!(outcome.warnings.is_empty());
+    }
+
+    #[test]
+    fn should_leave_unset_export_keys_as_none_for_legacy_precedence() {
+        // Setting only `intro` must not materialize a `legend` value, or the
+        // top-level `export_legend` key would be silently overridden.
+        let outcome = parse_config(
+            r#"export_legend = false
+
+[export]
+intro = "Notes:"
+"#,
+        );
+        let cfg = outcome.config.as_ref().expect("config should parse");
+        let export = cfg.export.clone().expect("export section should parse");
+        assert_eq!(export.legend, None);
+        assert_eq!(cfg.export_legend, Some(false));
+        assert!(outcome.warnings.is_empty());
+    }
+
+    #[test]
+    fn should_warn_on_unknown_export_keys() {
+        let outcome = parse_config(
+            r#"[export]
+intro = "Notes:"
+preamble = "typo"
+"#,
+        );
+        let export = outcome
+            .config
+            .as_ref()
+            .and_then(|cfg| cfg.export.clone())
+            .expect("export section should parse");
+        assert_eq!(export.intro(), "Notes:");
+        assert_eq!(
+            outcome.warnings,
+            vec!["Warning: Unknown config key 'export.preamble', ignoring".to_string()]
+        );
+    }
+
+    #[test]
+    fn should_warn_and_ignore_export_string_with_invalid_type() {
+        let outcome = parse_config(
+            r#"[export]
+intro = 42
+"#,
+        );
+        assert_eq!(
+            outcome.config.as_ref().and_then(|cfg| cfg.export.clone()),
+            None
+        );
+        assert_eq!(
+            outcome.warnings,
+            vec!["Warning: Config key 'export.intro' must be a string; ignoring value".to_string()]
+        );
+    }
+
+    #[test]
+    fn should_warn_and_ignore_export_bool_with_invalid_type() {
+        let outcome = parse_config(
+            r#"[export]
+scope_line = "no"
+"#,
+        );
+        assert_eq!(
+            outcome.config.as_ref().and_then(|cfg| cfg.export.clone()),
+            None
+        );
+        assert_eq!(
+            outcome.warnings,
+            vec![
+                "Warning: Config key 'export.scope_line' must be a boolean; ignoring value"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn should_warn_when_export_is_not_a_table() {
+        let outcome = parse_config("export = true\n");
+        assert_eq!(
+            outcome.config.as_ref().and_then(|cfg| cfg.export.clone()),
+            None
+        );
+        assert_eq!(
+            outcome.warnings,
+            vec!["Warning: Config key 'export' must be a table; ignoring value".to_string()]
+        );
+    }
+
+    // resolved export precedence
+
+    #[test]
+    fn should_default_resolved_export_to_shipped_behavior() {
+        let cfg = parse_config("").config.expect("config should parse");
+        let export = cfg.resolved_export();
+        assert!(export.legend());
+        assert!(export.scope_line());
+        assert!(export.pr_metadata());
+    }
+
+    #[test]
+    fn should_resolve_export_legend_from_the_legacy_flat_key() {
+        let cfg = parse_config("export_legend = false\n")
+            .config
+            .expect("config should parse");
+        assert!(!cfg.resolved_export().legend());
+    }
+
+    #[test]
+    fn should_let_export_section_override_the_legacy_legend_key() {
+        let cfg = parse_config("export_legend = false\n\n[export]\nlegend = true\n")
+            .config
+            .expect("config should parse");
+        assert!(cfg.resolved_export().legend());
+    }
+
+    #[test]
+    fn should_keep_legacy_legend_when_export_section_omits_it() {
+        // Guards the regression a fully-populated overrides struct would
+        // cause: adding `[export]` just to trim the intro must not switch
+        // the legend back on.
+        let cfg = parse_config("export_legend = false\n\n[export]\nintro = \"\"\n")
+            .config
+            .expect("config should parse");
+        let export = cfg.resolved_export();
+        assert!(!export.legend());
+        assert_eq!(export.intro(), "");
     }
 
     // config path resolution

@@ -6,7 +6,7 @@
 //!
 //! Key invariants enforced here:
 //! - The current local checkout is never treated as the source of truth.
-//!   Diffs are parsed from `gh pr diff`; SHAs are captured from PR metadata.
+//!   File identity comes from forge metadata; SHAs come from PR metadata.
 //! - `.tuicrignore` is applied only when the caller supplies a local
 //!   checkout path. Outside a checkout, the unfiltered diff is shown.
 //! - No checkout mutation. We never spawn `git checkout/fetch/reset/stash`
@@ -16,13 +16,13 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Result, TuicrError};
 use crate::forge::traits::{
-    ForgeBackend, PrSessionKey, PullRequestCommit, PullRequestDetails, PullRequestReviewMetadata,
-    PullRequestTarget,
+    ForgeBackend, PrSessionKey, PullRequestCommit, PullRequestDetails, PullRequestInfo,
+    PullRequestReviewMetadata, PullRequestTarget,
 };
-use crate::model::{DiffFile, ReviewSession, SessionDiffSource};
+use crate::model::{DiffFile, FilePatch, ReviewSession, SessionDiffSource};
 use crate::syntax::SyntaxHighlighter;
 use crate::tuicrignore;
-use crate::vcs::diff_parser::{DiffFormat, parse_unified_diff};
+use crate::vcs::diff_parser::parse_file_patches;
 
 /// Everything the App needs to enter PR review mode.
 #[derive(Debug)]
@@ -38,7 +38,18 @@ pub struct OpenedPullRequest {
     /// Best-effort metadata for detecting commits since the viewer's last
     /// submitted review. Empty when unsupported or unavailable.
     pub review_metadata: PullRequestReviewMetadata,
+    /// Extended PR metadata for the description panel.
+    pub pr_info: PullRequestInfo,
 }
+
+/// Send-safe data fetched before the main thread materializes diff hunks.
+pub type PrFetchData = (
+    PullRequestDetails,
+    Vec<FilePatch>,
+    Vec<PullRequestCommit>,
+    PullRequestReviewMetadata,
+    PullRequestInfo,
+);
 
 /// Open a PR target through a forge backend and prepare review state.
 ///
@@ -51,69 +62,71 @@ pub fn open_pull_request(
     local_checkout: Option<&Path>,
     highlighter: &SyntaxHighlighter,
 ) -> Result<OpenedPullRequest> {
-    let (details, patch, commits, review_metadata) = fetch_pr_data(backend, target)?;
+    let (details, patches, commits, review_metadata, pr_info) = fetch_pr_data(backend, target)?;
     prepare_open_pr(
         details,
-        &patch,
+        patches,
         commits,
         review_metadata,
+        pr_info,
         local_checkout,
         highlighter,
     )
 }
 
-/// Network-only half of the PR open path: fetch PR metadata, the raw
-/// patch text, and the commit list. Safe to run on a background thread
+/// Network-only half of the PR open path: fetch PR metadata, structured file
+/// patches, and the commit list. Safe to run on a background thread
 /// because it does no syntax parsing and holds nothing that isn't `Send`.
 ///
 /// The commit list is best-effort: if the forge fails on that endpoint
 /// only, we still return the diff so PR review proceeds without the
 /// inline selector. The first two calls remain required.
-pub fn fetch_pr_data(
-    backend: &dyn ForgeBackend,
-    target: PullRequestTarget,
-) -> Result<(
-    PullRequestDetails,
-    String,
-    Vec<PullRequestCommit>,
-    PullRequestReviewMetadata,
-)> {
-    let details = backend.get_pull_request(target)?;
-    let patch = backend.get_pull_request_diff(&details)?;
+pub fn fetch_pr_data(backend: &dyn ForgeBackend, target: PullRequestTarget) -> Result<PrFetchData> {
+    let pr_info = backend.get_pull_request_info(target)?;
+    let details = pr_info.details.clone();
+    let patches = backend.get_pull_request_diff(&details)?;
     let commits = backend
         .list_pull_request_commits(&details)
         .unwrap_or_default();
     let review_metadata = backend
         .list_pull_request_review_metadata(&details)
         .unwrap_or_default();
-    Ok((details, patch, commits, review_metadata))
+    Ok((details, patches, commits, review_metadata, pr_info))
 }
 
-/// CPU-only half of the PR open path: parse the patch, apply
-/// `.tuicrignore`, and build the session. Runs on the main thread because
-/// `SyntaxHighlighter` is not trivially `Send`-cloneable.
+/// CPU-only half of the PR open path: apply `.tuicrignore` to the raw
+/// patches, then parse the hunks and build the session. Filtering before the
+/// parse keeps an ignored large file from being highlighted at all. Runs on
+/// the main thread because `SyntaxHighlighter` is not trivially
+/// `Send`-cloneable.
 pub fn prepare_open_pr(
     details: PullRequestDetails,
-    patch: &str,
+    patches: Vec<FilePatch>,
     commits: Vec<PullRequestCommit>,
     review_metadata: PullRequestReviewMetadata,
+    pr_info: PullRequestInfo,
     local_checkout: Option<&Path>,
     highlighter: &SyntaxHighlighter,
 ) -> Result<OpenedPullRequest> {
-    let parsed = match parse_unified_diff(patch, DiffFormat::GitStyle, highlighter) {
-        Ok(files) => files,
-        Err(TuicrError::NoChanges) => {
-            return Err(TuicrError::Forge(format!(
-                "Pull request #{} has no file changes",
-                details.number
-            )));
-        }
-        Err(e) => return Err(e),
+    let had_patches = !patches.is_empty();
+    let patches = match local_checkout {
+        Some(root) => tuicrignore::filter_file_patches(root, patches),
+        None => patches,
     };
 
-    let diff_files = match local_checkout {
-        Some(root) => tuicrignore::filter_diff_files(root, parsed),
-        None => parsed,
+    let diff_files = if had_patches && patches.is_empty() {
+        Vec::new()
+    } else {
+        match parse_file_patches(patches, highlighter) {
+            Ok(files) => files,
+            Err(TuicrError::NoChanges) => {
+                return Err(TuicrError::Forge(format!(
+                    "Pull request #{} has no file changes",
+                    details.number
+                )));
+            }
+            Err(e) => return Err(e),
+        }
     };
 
     let key = PrSessionKey::from_details(&details);
@@ -130,6 +143,7 @@ pub fn prepare_open_pr(
         key,
         commits,
         review_metadata,
+        pr_info,
     })
 }
 
@@ -217,9 +231,11 @@ mod tests {
             self.calls.borrow_mut().push("get_pull_request");
             Ok(self.details.clone())
         }
-        fn get_pull_request_diff(&self, _pr: &PullRequestDetails) -> Result<String> {
+        fn get_pull_request_diff(&self, _pr: &PullRequestDetails) -> Result<Vec<FilePatch>> {
             self.calls.borrow_mut().push("get_pull_request_diff");
-            Ok(self.patch.clone())
+            Ok(crate::vcs::diff_parser::git_fixture_file_patches(
+                &self.patch,
+            ))
         }
         fn fetch_file_lines(&self, _req: ForgeFileLinesRequest) -> Result<Vec<DiffLine>> {
             unimplemented!()
@@ -241,8 +257,10 @@ mod tests {
             _pr: &PullRequestDetails,
             _start_sha: &str,
             _end_sha: &str,
-        ) -> Result<String> {
-            Ok(self.patch.clone())
+        ) -> Result<Vec<FilePatch>> {
+            Ok(crate::vcs::diff_parser::git_fixture_file_patches(
+                &self.patch,
+            ))
         }
         fn create_review(
             &self,
@@ -296,10 +314,9 @@ index 1111111..2222222 100644
         );
     }
 
-    /// Patch fixture covering add/modify/delete/rename in a single PR
-    /// diff, mirroring what `gh pr diff --patch --color never` would
-    /// emit. Acts as a regression guard against future changes to the
-    /// shared diff parser.
+    /// Patch fixture covering add/modify/delete/rename in a single PR diff.
+    /// Tests pair its file blocks with explicit metadata before invoking the
+    /// shared hunk parser.
     const MULTI_STATUS_PATCH: &str = r##"diff --git a/added.rs b/added.rs
 new file mode 100644
 index 0000000..abc1234
@@ -388,5 +405,74 @@ rename to new_name.rs
             msg.contains("Pull request #125 has no file changes"),
             "unexpected error message: {msg}"
         );
+    }
+
+    #[test]
+    fn should_drop_ignored_patches_before_parsing_them() {
+        // given a checkout whose .tuicrignore excludes dist/, and a PR diff
+        // whose ignored patch body is malformed (a hunk header the parser
+        // rejects)
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        std::fs::write(dir.path().join(".tuicrignore"), "dist/\n")
+            .expect("failed to write .tuicrignore");
+        let patches = vec![
+            FilePatch::new(
+                None,
+                Some(std::path::PathBuf::from("src/main.rs")),
+                crate::model::FileStatus::Modified,
+                "@@ -1,3 +1,3 @@\n pub fn answer() -> u32 {\n-    41\n+    42\n }\n",
+            ),
+            FilePatch::new(
+                None,
+                Some(std::path::PathBuf::from("dist/bundle.js")),
+                crate::model::FileStatus::Modified,
+                "@@not-a-hunk\n+minified one-liner\n",
+            ),
+        ];
+        let highlighter = SyntaxHighlighter::default();
+        // when
+        let opened = prepare_open_pr(
+            details(),
+            patches,
+            Vec::new(),
+            crate::forge::traits::PullRequestReviewMetadata::default(),
+            crate::forge::traits::PullRequestInfo::from_details(details()),
+            Some(dir.path()),
+            &highlighter,
+        )
+        .expect("ignored patch must never reach the parser");
+        // then only the kept file was parsed into the review
+        let kept: Vec<String> = opened
+            .diff_files
+            .iter()
+            .map(|f| f.display_path().display().to_string())
+            .collect();
+        assert_eq!(kept, vec!["src/main.rs"]);
+    }
+
+    #[test]
+    fn should_open_an_empty_review_when_every_pr_patch_is_ignored() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        std::fs::write(dir.path().join(".tuicrignore"), "dist/\n")
+            .expect("failed to write .tuicrignore");
+        let highlighter = SyntaxHighlighter::default();
+
+        let opened = prepare_open_pr(
+            details(),
+            vec![FilePatch::new(
+                None,
+                Some(std::path::PathBuf::from("dist/bundle.js")),
+                crate::model::FileStatus::Modified,
+                "@@ -1 +1 @@\n-old\n+new\n",
+            )],
+            Vec::new(),
+            crate::forge::traits::PullRequestReviewMetadata::default(),
+            crate::forge::traits::PullRequestInfo::from_details(details()),
+            Some(dir.path()),
+            &highlighter,
+        )
+        .expect("an ignored-only PR should open as an empty review");
+
+        assert!(opened.diff_files.is_empty());
     }
 }

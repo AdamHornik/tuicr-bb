@@ -2,16 +2,40 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-use crate::error::Result;
+use crate::error::{Result, TuicrError};
 use crate::forge::remote_comments::RemoteReviewThread;
 use crate::forge::submit::SubmitEvent;
-use crate::model::{DiffLine, FileStatus};
+use crate::model::{DiffLine, FilePatch, FileStatus};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ForgeKind {
     GitHub,
     GitLab,
+    /// Gitea, reached through the `tea` CLI.
+    Gitea,
+    /// Bitbucket Cloud only. Data Center speaks an unrelated REST 1.0 API and
+    /// is rejected during remote-URL parsing.
+    Bitbucket,
+    #[serde(rename = "azure_devops")]
+    AzureDevOps,
+    /// Self-hosted Gerrit Code Review. A Gerrit *change* takes the place of a
+    /// pull request and its numeric change number is the PR number.
+    Gerrit,
+}
+
+impl ForgeKind {
+    /// Brand name as users expect to see it, for messages and export headers.
+    pub fn display_name(self) -> &'static str {
+        match self {
+            ForgeKind::GitHub => "GitHub",
+            ForgeKind::GitLab => "GitLab",
+            ForgeKind::Gitea => "Gitea",
+            ForgeKind::Bitbucket => "Bitbucket",
+            ForgeKind::AzureDevOps => "Azure DevOps",
+            ForgeKind::Gerrit => "Gerrit",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,12 +73,101 @@ impl ForgeRepository {
         }
     }
 
+    /// Gitea repositories are always `<owner>/<repo>` — no nested groups.
+    pub fn gitea(
+        host: impl Into<String>,
+        owner: impl Into<String>,
+        name: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: ForgeKind::Gitea,
+            host: host.into(),
+            owner: owner.into(),
+            name: name.into(),
+        }
+    }
+
+    /// `owner` carries the Bitbucket Cloud workspace.
+    pub fn bitbucket(
+        host: impl Into<String>,
+        owner: impl Into<String>,
+        name: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: ForgeKind::Bitbucket,
+            host: host.into(),
+            owner: owner.into(),
+            name: name.into(),
+        }
+    }
+
+    /// Build an Azure DevOps repository coordinate.
+    ///
+    /// Azure repos live under `organization/project/repository` — one level
+    /// deeper than GitHub/GitLab. We pack `organization/project` into `owner`
+    /// (the same trick GitLab uses for nested subgroups) and keep `name` as the
+    /// bare repository. `crate::forge::azure::az::azure_coords` splits `owner`
+    /// back into `(organization, project)`.
+    pub fn azure(
+        host: impl Into<String>,
+        owner: impl Into<String>,
+        name: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: ForgeKind::AzureDevOps,
+            host: host.into(),
+            owner: owner.into(),
+            name: name.into(),
+        }
+    }
+
+    /// Build a Gerrit repository coordinate from a project path.
+    ///
+    /// Gerrit has no owner/repo split: a project is a single path such as
+    /// `myrepo` or `platform/frameworks/base`. We keep the last segment in
+    /// `name` and the parent path in `owner` — the same packing Azure DevOps
+    /// uses for `org/project`, so PR slugs round-trip through
+    /// [`crate::slug::PrSlug`]. A single-segment project has no parent, and an
+    /// empty `owner` would produce the unparseable slug `ge:/repo/pr/1`, so it
+    /// falls back to the host. [`crate::forge::gerrit::api::gerrit_project`]
+    /// reverses the packing.
+    pub fn gerrit(host: impl Into<String>, project: impl Into<String>) -> Self {
+        let host = host.into();
+        let project = project.into();
+        let (owner, name) = match project.rsplit_once('/') {
+            Some((parent, last)) if !parent.is_empty() && !last.is_empty() => {
+                (parent.to_string(), last.to_string())
+            }
+            _ => (host.clone(), project),
+        };
+        Self {
+            kind: ForgeKind::Gerrit,
+            host,
+            owner,
+            name,
+        }
+    }
+
     pub fn slug(&self) -> String {
         format!("{}/{}", self.owner, self.name)
     }
 
     pub fn display_name(&self) -> String {
-        if self.host == "github.com" || self.host == "gitlab.com" {
+        if self.kind == ForgeKind::Gerrit {
+            // `owner` mirrors the host for single-segment projects, so the
+            // generic `host/owner/name` shape would repeat it.
+            return format!(
+                "{}/{}",
+                self.host,
+                crate::forge::gerrit::api::gerrit_project(self)
+            );
+        }
+        if self.host == "github.com"
+            || self.host == "gitlab.com"
+            || self.host == "bitbucket.org"
+            || self.host == "dev.azure.com"
+            || self.host == "gitea.com"
+        {
             self.slug()
         } else {
             format!("{}/{}", self.host, self.slug())
@@ -365,14 +478,88 @@ pub struct PullRequestReviewRecord {
     pub commit_oid: Option<String>,
 }
 
+/// A reviewer's latest response on a pull request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestReviewStatus {
+    pub author: Option<String>,
+    pub state: String,
+    pub submitted_at: Option<DateTime<Utc>>,
+}
+
+/// A CI check or commit status attached to a pull request head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestCheckStatus {
+    pub name: String,
+    /// GitHub CheckRun status (`COMPLETED`, `IN_PROGRESS`, …) or empty for legacy contexts.
+    pub status: Option<String>,
+    /// Normalized outcome: `SUCCESS`, `FAILURE`, `PENDING`, etc.
+    pub conclusion: Option<String>,
+    /// Link to the check run or legacy status context, when available.
+    pub url: Option<String>,
+}
+
+/// A top-level PR conversation comment (issue comment), not tied to a review or diff line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestIssueComment {
+    pub author: Option<String>,
+    pub body: String,
+    pub url: Option<String>,
+    pub created_at: Option<DateTime<Utc>>,
+}
+
+/// Extended PR metadata rendered at the top of the diff view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestInfo {
+    pub details: PullRequestDetails,
+    pub review_decision: Option<String>,
+    pub mergeable: Option<String>,
+    pub merge_state: Option<String>,
+    pub requested_reviewers: Vec<String>,
+    pub latest_reviews: Vec<PullRequestReviewStatus>,
+    pub checks: Vec<PullRequestCheckStatus>,
+    pub issue_comments: Vec<PullRequestIssueComment>,
+}
+
+impl PullRequestInfo {
+    /// Minimal panel info when a backend only exposes base PR details.
+    pub fn from_details(details: PullRequestDetails) -> Self {
+        Self {
+            details,
+            review_decision: None,
+            mergeable: None,
+            merge_state: None,
+            requested_reviewers: Vec::new(),
+            latest_reviews: Vec::new(),
+            checks: Vec::new(),
+            issue_comments: Vec::new(),
+        }
+    }
+}
+
 pub trait ForgeBackend {
     fn list_pull_requests(&self, query: PullRequestListQuery) -> Result<PagedPullRequests>;
     fn get_pull_request(&self, target: PullRequestTarget) -> Result<PullRequestDetails>;
-    fn get_pull_request_diff(&self, pr: &PullRequestDetails) -> Result<String>;
+    /// Fetch PR metadata for the description panel. The default builds a
+    /// minimal [`PullRequestInfo`] from [`Self::get_pull_request`].
+    fn get_pull_request_info(&self, target: PullRequestTarget) -> Result<PullRequestInfo> {
+        let details = self.get_pull_request(target)?;
+        Ok(PullRequestInfo::from_details(details))
+    }
+    fn get_pull_request_diff(&self, pr: &PullRequestDetails) -> Result<Vec<FilePatch>>;
     /// Fetch the requested file lines from the forge for context expansion.
     /// Implementations may optimize by reading from a local checkout when
     /// available; the trait does not require that path.
     fn fetch_file_lines(&self, request: ForgeFileLinesRequest) -> Result<Vec<DiffLine>>;
+    /// Return the whole file at the revision described by `request`, exactly as
+    /// stored: unlike [`Self::fetch_file_lines`], tabs are not expanded, so the
+    /// result is safe to write back out as a file. `start_line` and `end_line`
+    /// are ignored. The default errors; backends able to read a revision
+    /// override it.
+    fn fetch_file_content(&self, _request: ForgeFileLinesRequest) -> Result<String> {
+        Err(TuicrError::Forge(
+            "this backend cannot read file contents".to_string(),
+        ))
+    }
     /// Return the total number of lines in a file at the revision described by
     /// `request`. The `start_line` and `end_line` fields of the request are
     /// ignored. Default returns `Ok(0)`; real forge backends override this.
@@ -416,7 +603,7 @@ pub trait ForgeBackend {
         pr: &PullRequestDetails,
         start_sha: &str,
         end_sha: &str,
-    ) -> Result<String>;
+    ) -> Result<Vec<FilePatch>>;
     /// Optional path to a local checkout the backend may consult as an
     /// optimization. The default returns `None`; callers must never treat
     /// this path as the source of truth for PR contents.
